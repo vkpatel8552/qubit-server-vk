@@ -636,11 +636,12 @@ app.post('/api/auth/request-register', async (req, res) => {
     res.json({ ok: true, email: emailLower });
   } catch (err) {
     console.error('[register] Email send failed:', err.message);
-    // Tell the client exactly what is misconfigured
+    const is401 = err.message.includes('401');
     res.status(500).json({
-      error: 'Failed to send registration email.',
-      detail: err.message,
-      setup: 'Configure SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, and FRONTEND_URL in your environment variables.'
+      error: is401
+        ? 'Mailgun authentication failed (401). Your MAILGUN_API_KEY is wrong — make sure you are using the Private API Key from the Mailgun dashboard, NOT the SMTP password.'
+        : 'Failed to send registration email: ' + err.message,
+      hint: 'Mailgun dashboard → Settings → API Keys → Private API key (starts with key-...)'
     });
   }
 });
@@ -1028,6 +1029,44 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 // ══════════════════════════════════════════════════════════
 // HEALTH
 // ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
+// MAILGUN DIAGNOSTIC — GET /api/test/mailgun?to=you@domain.com
+// Open this URL in your browser to verify Mailgun is working
+// ══════════════════════════════════════════════════════════
+app.get('/api/test/mailgun', async (req, res) => {
+  const cfg = CONFIG.mailgun;
+  const checks = {
+    MAILGUN_API_KEY:  cfg.apiKey  ? `✓ set (${cfg.apiKey.slice(0,6)}…)` : '✗ NOT SET',
+    MAILGUN_DOMAIN:   cfg.domain  ? `✓ ${cfg.domain}` : '✗ NOT SET',
+    MAILGUN_FROM:     cfg.from    ? `✓ ${cfg.from}`   : '✗ NOT SET',
+    MAILGUN_REGION:   cfg.region  || 'us (default)',
+    FRONTEND_URL:     CONFIG.frontendUrl,
+    api_endpoint:     `https://api${cfg.region==='eu'?'.eu':''}.mailgun.net/v3/${cfg.domain}/messages`,
+  };
+
+  if (!req.query.to) {
+    return res.json({ status: 'config_check', checks, usage: 'Add ?to=your@email.com to send a test email' });
+  }
+
+  try {
+    const result = await sendMailgunEmail({
+      to:      req.query.to,
+      subject: 'Qubit — Mailgun test email',
+      text:    'If you receive this, Mailgun is configured correctly.',
+      html:    '<p style="font-family:sans-serif">If you receive this, <strong>Mailgun is configured correctly ✓</strong></p>',
+    });
+    res.json({ status: 'sent', messageId: result.id, to: req.query.to, checks });
+  } catch (err) {
+    res.status(500).json({ status: 'failed', error: err.message, checks,
+      fix: err.message.includes('401')
+        ? 'Wrong API key. Use Private API Key from Mailgun → Settings → API Keys (NOT the SMTP password)'
+        : err.message.includes('404') || err.message.includes('domain')
+        ? 'Domain not found. Check MAILGUN_DOMAIN matches exactly what is in your Mailgun account'
+        : 'Check all env vars and try again'
+    });
+  }
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true, service: 'qubit-server', version: '1.2.0',
