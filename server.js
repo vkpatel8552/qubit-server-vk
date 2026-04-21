@@ -1,5 +1,6 @@
 /**
  * qubit-server — Backend proxy for the Qubit QA platform
+ * Updated: Uses new /rest/api/3/search/jql endpoint (old /search removed by Atlassian Aug 2025)
  */
 
 'use strict';
@@ -119,7 +120,7 @@ class AtlassianClient {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             try { resolve(JSON.parse(raw)); } catch { resolve(raw); }
           } else {
-            const err = new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 200)}`);
+            const err = new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 300)}`);
             err.statusCode = res.statusCode;
             reject(err);
           }
@@ -150,18 +151,26 @@ class AtlassianClient {
     const fieldParam = fields ? `?fields=${fields.join(',')}` : '';
     return this._request('GET', `/rest/api/3/issue/${issueKey}${fieldParam}`);
   }
- async searchByJql(jql, fields = ['summary', 'status', 'issuetype'], maxResults = 100) {
-    // Use new /rest/api/3/search/jql endpoint (old /search deprecated by Atlassian Aug 2025)
+  /**
+   * Uses the NEW /rest/api/3/search/jql endpoint (old /search removed Aug 2025).
+   * Handles token-based pagination; aggregates up to ~1000 issues max.
+   */
+  async searchByJql(jql, fields = ['summary', 'status', 'issuetype'], maxResults = 100) {
     const allIssues = [];
     let nextPageToken = null;
+    let safetyCounter = 0;
+    const maxPages = 10; // safety cap — prevents infinite loops
     do {
       const payload = { jql, fields, maxResults };
       if (nextPageToken) payload.nextPageToken = nextPageToken;
       const res = await this._request('POST', '/rest/api/3/search/jql', payload);
       if (Array.isArray(res.issues)) allIssues.push(...res.issues);
       nextPageToken = res.nextPageToken || null;
+      safetyCounter++;
       if (res.isLast === true) break;
-    } while (nextPageToken && allIssues.length < maxResults * 10);
+      if (!nextPageToken) break;
+      if (safetyCounter >= maxPages) break;
+    } while (true);
     return { issues: allIssues };
   }
 }
@@ -226,15 +235,20 @@ async function fetchStoriesParallel(client, stories, onLog) {
           CONFIG.mcp.maxRetries, onLog);
         const descText = adfToPlainText(detail.fields.description);
         results[i] = {
-          id: detail.key, title: detail.fields.summary,
+          id: detail.key,
+          title: detail.fields.summary,
           desc: descText.slice(0, 500),
           ac: extractAcceptanceCriteria(descText)
         };
         if (onLog) onLog(`  worker-${workerId} ✓ ${story.key} (${i + 1}/${stories.length})`, 'ok');
       } catch (err) {
         if (onLog) onLog(`  worker-${workerId} ✗ ${story.key} — ${err.message}`, 'err');
-        results[i] = { id: story.key, title: story.fields.summary || story.key,
-          desc: '(description unavailable)', ac: ['Acceptance criteria unavailable'] };
+        results[i] = {
+          id: story.key,
+          title: (story.fields && story.fields.summary) || story.key,
+          desc: '(description unavailable)',
+          ac: ['Acceptance criteria unavailable']
+        };
       }
     }
   };
@@ -399,13 +413,23 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering on Render
   res.flushHeaders();
+
   const send = (event, data) => {
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    try {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (e) { console.error('SSE write failed:', e.message); }
   };
   const log = (msg, level = 'info') => send('log', { msg, level, ts: Date.now() });
   const phase = (idx, state, sub) => send('phase', { idx, state, sub });
+
+  // Heartbeat keeps the SSE connection alive through proxies
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch (e) {}
+  }, 15000);
+
   try {
     log(`╔═══ TEST PLAN GENERATION STARTED ═══`);
     log(`Project: ${projectName} · Epics: ${epics.join(', ')}`);
@@ -426,11 +450,11 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       const epicData = {
         key: epic.key, title: epic.fields.summary,
         description: descText.slice(0, 800),
-        status: epic.fields.status?.name || 'Unknown',
-        assignee: epic.fields.assignee?.displayName || 'Unassigned',
-        reporter: epic.fields.reporter?.displayName || 'Unknown',
+        status: (epic.fields.status && epic.fields.status.name) || 'Unknown',
+        assignee: (epic.fields.assignee && epic.fields.assignee.displayName) || 'Unassigned',
+        reporter: (epic.fields.reporter && epic.fields.reporter.displayName) || 'Unknown',
         dueDate: epic.fields.duedate || 'TBD',
-        priority: epic.fields.priority?.name || 'Medium'
+        priority: (epic.fields.priority && epic.fields.priority.name) || 'Medium'
       };
       epicsMeta.push({ id, meta: epicData });
       log(`✓ Epic loaded: ${epicData.title}`, 'ok');
@@ -446,18 +470,24 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       const searchResult = await client.withRetry(`searchByJql(${em.id})`,
         () => client.searchByJql(jql, ['summary', 'status', 'issuetype'], 100),
         CONFIG.mcp.maxRetries, log);
-      storyListByEpic[em.id] = searchResult.issues;
-      log(`✓ ${searchResult.issues.length} stories for ${em.id}`, 'ok');
-      searchResult.issues.forEach(s => log(`    • ${s.key} — ${s.fields.summary}`));
-      totalStories += searchResult.issues.length;
+      const issues = searchResult.issues || [];
+      storyListByEpic[em.id] = issues;
+      log(`✓ ${issues.length} stories for ${em.id}`, 'ok');
+      issues.forEach(s => log(`    • ${s.key} — ${s.fields && s.fields.summary}`));
+      totalStories += issues.length;
     }
     phase(2, 'done', `${totalStories} stories found`);
+
+    if (totalStories === 0) {
+      log(`⚠ No stories found for the given epics. Check JQL permissions or epic IDs.`, 'warn');
+    }
+
     phase(3, 'active', `0 of ${totalStories}`);
     const allEpics = [];
     let done = 0;
     for (const em of epicsMeta) {
       const list = storyListByEpic[em.id];
-      const details = await fetchStoriesParallel(client, list, log);
+      const details = list.length > 0 ? await fetchStoriesParallel(client, list, log) : [];
       allEpics.push({ id: em.id, meta: em.meta, stories: details });
       done += list.length;
       phase(3, 'active', `${done} of ${totalStories}`);
@@ -507,11 +537,15 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
         scenarios: summary.totals.stories * 3, ac: summary.totals.acceptanceCriteria
       }
     });
-    res.end();
   } catch (err) {
-    log(`╚═══ FAILED: ${err.message} ═══`, 'err');
-    send('error', { error: err.message });
-    res.end();
+    console.error('[generate] FAILED:', err);
+    try {
+      log(`╚═══ FAILED: ${err.message} ═══`, 'err');
+      send('error', { error: err.message || 'Unknown error' });
+    } catch (e) { console.error('Final SSE send failed:', e.message); }
+  } finally {
+    clearInterval(heartbeat);
+    try { res.end(); } catch (e) {}
   }
 });
 
@@ -537,13 +571,14 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 
 app.get('/api/health', (_req, res) => {
   res.json({
-    ok: true, service: 'qubit-server', version: '1.0.0',
+    ok: true, service: 'qubit-server', version: '1.1.0',
     uptimeSec: Math.round(process.uptime()),
     config: {
       allowedDomains: CONFIG.allowedDomains,
       mcpTimeout: CONFIG.mcp.timeout,
       mcpMaxRetries: CONFIG.mcp.maxRetries,
-      mcpParallelWorkers: CONFIG.mcp.parallelWorkers
+      mcpParallelWorkers: CONFIG.mcp.parallelWorkers,
+      jiraApiVersion: '/rest/api/3/search/jql (new endpoint)'
     }
   });
 });
@@ -555,7 +590,8 @@ app.use((err, _req, res, _next) => {
 
 app.listen(CONFIG.port, '0.0.0.0', () => {
   console.log('─────────────────────────────────────');
-  console.log('  Qubit Server listening on port', CONFIG.port);
+  console.log('  Qubit Server v1.1.0 listening on port', CONFIG.port);
+  console.log('  Jira API: /rest/api/3/search/jql (new endpoint)');
   console.log('  Data dir:', CONFIG.dataDir);
   console.log('  Temp dir:', CONFIG.tempDir);
   console.log('  Allowed domains:', CONFIG.allowedDomains.join(', '));
