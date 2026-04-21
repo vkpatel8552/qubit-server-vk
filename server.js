@@ -319,24 +319,31 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
   res.json({ user: publicUser });
 });
 
-app.put('/api/auth/profile', authMiddleware, async (req, res) => {
-  const { firstName, lastName, org, role, phone, bio, avatar } = req.body || {};
+app.post('/api/auth/password', authMiddleware, async (req, res) => {
+  const { oldPassword, newPassword } = req.body || {};
+  if (!oldPassword || !newPassword) {
+    return res.status(400).json({ error: 'Both old and new password required' });
+  }
   const users = await readJson(DB.usersFile);
   const user = users[req.user.email];
-  if (firstName) user.firstName = firstName;
-  if (lastName) user.lastName = lastName;
-  if (firstName && lastName) {
-    user.fullName = `${firstName} ${lastName}`;
-    user.initials = (firstName[0] + lastName[0]).toUpperCase();
+  if (!user || user.passwordHash !== hashPassword(oldPassword, req.user.email)) {
+    return res.status(401).json({ error: 'Current password is incorrect' });
   }
-  if (org !== undefined) user.org = org;
-  if (role !== undefined) user.role = role;
-  if (phone !== undefined) user.phone = phone;
-  if (bio !== undefined) user.bio = bio;
-  if (avatar !== undefined) user.avatar = avatar;
+  if (!passwordValid(newPassword)) {
+    return res.status(400).json({ error: 'New password must be 8+ chars with uppercase, lowercase, number, and symbol' });
+  }
+  if (oldPassword === newPassword) {
+    return res.status(400).json({ error: 'New password must be different from current password' });
+  }
+  user.passwordHash = hashPassword(newPassword, req.user.email);
   await writeJson(DB.usersFile, users);
-  const { passwordHash, ...publicUser } = user;
-  res.json({ user: publicUser });
+  // Invalidate all existing sessions except current one (security best practice)
+  const sessions = await readJson(DB.sessionsFile);
+  Object.keys(sessions).forEach(t => {
+    if (sessions[t].email === req.user.email && t !== req.token) delete sessions[t];
+  });
+  await writeJson(DB.sessionsFile, sessions);
+  res.json({ ok: true, message: 'Password updated successfully' });
 });
 
 app.get('/api/connectors/status', authMiddleware, async (req, res) => {
