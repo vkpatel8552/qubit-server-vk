@@ -1,6 +1,6 @@
 /**
  * qubit-server — Backend proxy for the Qubit QA platform
- * Updated: Uses new /rest/api/3/search/jql endpoint (old /search removed by Atlassian Aug 2025)
+ * Updated: stats tracking, invite-based registration, Google SSO, password change
  */
 
 'use strict';
@@ -22,6 +22,9 @@ const CONFIG = {
   jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
   allowedDomains: (process.env.ALLOWED_DOMAINS || 'clearlyrated.com,thoughtminds.io').split(','),
   corsOrigin: process.env.CORS_ORIGIN || '*',
+  googleClientId: process.env.GOOGLE_CLIENT_ID || '',
+  inviteExpiryMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+  appBaseUrl: process.env.APP_BASE_URL || 'http://localhost:4000',
   mcp: {
     timeout: parseInt(process.env.MCP_TIMEOUT_MS || '300000', 10),
     maxRetries: parseInt(process.env.MCP_MAX_RETRIES || '5', 10),
@@ -37,7 +40,9 @@ const DB = {
   usersFile: path.join(CONFIG.dataDir, 'users.json'),
   sessionsFile: path.join(CONFIG.dataDir, 'sessions.json'),
   connectorsFile: path.join(CONFIG.dataDir, 'connectors.json'),
-  planIndexFile: path.join(CONFIG.dataDir, 'plan-index.json')
+  planIndexFile: path.join(CONFIG.dataDir, 'plan-index.json'),
+  statsFile: path.join(CONFIG.dataDir, 'stats.json'),
+  invitesFile: path.join(CONFIG.dataDir, 'invites.json')
 };
 
 async function readJson(file, fallback = {}) {
@@ -80,6 +85,70 @@ async function authMiddleware(req, res, next) {
   req.token = token;
   req.session = session;
   next();
+}
+
+// ─── Stats helpers ──────────────────────────────────────────────────────────
+async function recordStat(email, type) {
+  const stats = await readJson(DB.statsFile, { global: {}, byUser: {} });
+  if (!stats.global) stats.global = {};
+  if (!stats.byUser) stats.byUser = {};
+  // Global totals
+  stats.global[type] = (stats.global[type] || 0) + 1;
+  // Per-user totals + history
+  if (!stats.byUser[email]) stats.byUser[email] = { testPlans: 0, testCases: 0, autoScripts: 0, history: [] };
+  stats.byUser[email][type] = (stats.byUser[email][type] || 0) + 1;
+  stats.byUser[email].history.push({ date: new Date().toISOString().slice(0, 10), type });
+  // Keep only last 365 history entries per user
+  if (stats.byUser[email].history.length > 365) {
+    stats.byUser[email].history = stats.byUser[email].history.slice(-365);
+  }
+  await writeJson(DB.statsFile, stats);
+}
+
+function buildChartData(allHistory) {
+  // Last 6 months, all users combined
+  const now = new Date();
+  const months = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    months.push({ key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, label: d.toLocaleString('default', { month: 'short', year: '2-digit' }) });
+  }
+  const buckets = { testPlans: {}, testCases: {}, autoScripts: {} };
+  months.forEach(m => { buckets.testPlans[m.key] = 0; buckets.testCases[m.key] = 0; buckets.autoScripts[m.key] = 0; });
+  allHistory.forEach(({ date, type }) => {
+    const mk = date.slice(0, 7);
+    if (buckets[type] && buckets[type][mk] !== undefined) buckets[type][mk]++;
+  });
+  return {
+    labels: months.map(m => m.label),
+    testPlans: months.map(m => buckets.testPlans[m.key]),
+    testCases: months.map(m => buckets.testCases[m.key]),
+    autoScripts: months.map(m => buckets.autoScripts[m.key])
+  };
+}
+
+// ─── Google token verification ───────────────────────────────────────────────
+function verifyGoogleToken(idToken) {
+  return new Promise((resolve, reject) => {
+    const url = `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`;
+    const u = new URL(url);
+    const opts = { hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers: { Accept: 'application/json' } };
+    const req = https.request(opts, res => {
+      let chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (data.error_description || data.error) return reject(new Error(data.error_description || data.error));
+          if (CONFIG.googleClientId && data.aud !== CONFIG.googleClientId) return reject(new Error('Token audience mismatch'));
+          resolve(data);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error('Google token verify timeout')); });
+    req.end();
+  });
 }
 
 class AtlassianClient {
@@ -151,15 +220,11 @@ class AtlassianClient {
     const fieldParam = fields ? `?fields=${fields.join(',')}` : '';
     return this._request('GET', `/rest/api/3/issue/${issueKey}${fieldParam}`);
   }
-  /**
-   * Uses the NEW /rest/api/3/search/jql endpoint (old /search removed Aug 2025).
-   * Handles token-based pagination; aggregates up to ~1000 issues max.
-   */
   async searchByJql(jql, fields = ['summary', 'status', 'issuetype'], maxResults = 100) {
     const allIssues = [];
     let nextPageToken = null;
     let safetyCounter = 0;
-    const maxPages = 10; // safety cap — prevents infinite loops
+    const maxPages = 10;
     do {
       const payload = { jql, fields, maxResults };
       if (nextPageToken) payload.nextPageToken = nextPageToken;
@@ -266,13 +331,33 @@ app.use((req, _res, next) => {
   next();
 });
 
+// ══════════════════════════════════════════════════════════
+// AUTH — REGISTER (supports optional invite token)
+// ══════════════════════════════════════════════════════════
 app.post('/api/auth/register', async (req, res) => {
-  const { firstName, lastName, email, phone, org, role, password, avatar } = req.body || {};
+  const { firstName, lastName, email, phone, org, role, password, avatar, inviteToken } = req.body || {};
   if (!firstName || !lastName || !email || !org || !role || !password) return res.status(400).json({ error: 'Missing required fields' });
   if (!domainOk(email)) return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} emails allowed` });
   if (!passwordValid(password)) return res.status(400).json({ error: 'Password must be 8+ chars with uppercase, number, symbol' });
-  const users = await readJson(DB.usersFile);
+
+  // Validate invite token if provided
   const emailLower = email.toLowerCase();
+  if (inviteToken) {
+    const invites = await readJson(DB.invitesFile);
+    const invite = invites[inviteToken];
+    if (!invite) return res.status(400).json({ error: 'Invalid or expired invite link' });
+    if (Date.now() > invite.expiresAt) {
+      delete invites[inviteToken];
+      await writeJson(DB.invitesFile, invites);
+      return res.status(400).json({ error: 'Invite link has expired' });
+    }
+    if (invite.email.toLowerCase() !== emailLower) return res.status(400).json({ error: 'Email does not match invite' });
+    // Consume invite
+    delete invites[inviteToken];
+    await writeJson(DB.invitesFile, invites);
+  }
+
+  const users = await readJson(DB.usersFile);
   if (users[emailLower]) return res.status(409).json({ error: 'Account already exists' });
   const initials = (firstName[0] + lastName[0]).toUpperCase();
   const user = {
@@ -292,6 +377,9 @@ app.post('/api/auth/register', async (req, res) => {
   res.json({ user: publicUser, token });
 });
 
+// ══════════════════════════════════════════════════════════
+// AUTH — LOGIN
+// ══════════════════════════════════════════════════════════
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Missing credentials' });
@@ -307,6 +395,135 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ user: publicUser, token });
 });
 
+// ══════════════════════════════════════════════════════════
+// AUTH — GOOGLE SSO
+// ══════════════════════════════════════════════════════════
+app.post('/api/auth/google', async (req, res) => {
+  const { credential } = req.body || {};
+  if (!credential) return res.status(400).json({ error: 'Google credential required' });
+  let payload;
+  try {
+    payload = await verifyGoogleToken(credential);
+  } catch (err) {
+    return res.status(401).json({ error: `Google verification failed: ${err.message}` });
+  }
+  const email = (payload.email || '').toLowerCase();
+  if (!email) return res.status(400).json({ error: 'No email in Google token' });
+  if (!domainOk(email)) return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} accounts allowed` });
+
+  const users = await readJson(DB.usersFile);
+  let user = users[email];
+  if (!user) {
+    // Auto-create user from Google profile
+    const firstName = payload.given_name || email.split('@')[0];
+    const lastName = payload.family_name || '';
+    const initials = ((firstName[0] || '') + (lastName[0] || '')).toUpperCase() || '?';
+    user = {
+      firstName, lastName, fullName: payload.name || firstName,
+      email, phone: '', org: email.split('@')[1], role: 'Other', bio: '', initials,
+      avatar: payload.picture ? { type: 'photo', data: payload.picture } : { type: 'initials' },
+      passwordHash: '',
+      googleSub: payload.sub,
+      createdAt: new Date().toISOString()
+    };
+    users[email] = user;
+    await writeJson(DB.usersFile, users);
+  }
+  const token = createToken();
+  const sessions = await readJson(DB.sessionsFile);
+  sessions[token] = { email, createdAt: Date.now() };
+  await writeJson(DB.sessionsFile, sessions);
+  const { passwordHash, ...publicUser } = user;
+  res.json({ user: publicUser, token });
+});
+
+// ══════════════════════════════════════════════════════════
+// AUTH — SELF-SERVICE REGISTRATION REQUEST
+// ══════════════════════════════════════════════════════════
+app.post('/api/auth/request-register', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  const emailLower = email.toLowerCase();
+  if (!domainOk(emailLower)) return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} emails allowed` });
+  const users = await readJson(DB.usersFile);
+  if (users[emailLower]) return res.status(409).json({ error: 'An account already exists for this email. Please sign in.' });
+
+  const invites = await readJson(DB.invitesFile);
+  // Reuse existing non-expired token for same email
+  const existing = Object.entries(invites).find(([, v]) => v.email === emailLower && Date.now() < v.expiresAt);
+  if (existing) {
+    const registrationUrl = `${CONFIG.appBaseUrl}?register=${existing[0]}`;
+    return res.json({ ok: true, registrationUrl, expiresAt: invites[existing[0]].expiresAt });
+  }
+
+  const token = createToken();
+  const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours for self-registration
+  invites[token] = { email: emailLower, invitedBy: null, createdAt: Date.now(), expiresAt };
+  await writeJson(DB.invitesFile, invites);
+  const registrationUrl = `${CONFIG.appBaseUrl}?register=${token}`;
+  console.log(`[register-request] ${emailLower} → ${registrationUrl}`);
+  res.json({ ok: true, registrationUrl, expiresAt });
+});
+
+app.get('/api/auth/register-token/:token', async (req, res) => {
+  const invites = await readJson(DB.invitesFile);
+  const invite = invites[req.params.token];
+  if (!invite) return res.status(404).json({ error: 'Invalid registration link' });
+  if (Date.now() > invite.expiresAt) {
+    delete invites[req.params.token];
+    await writeJson(DB.invitesFile, invites);
+    return res.status(410).json({ error: 'Registration link has expired. Please request a new one.' });
+  }
+  res.json({ email: invite.email, expiresAt: invite.expiresAt });
+});
+
+// ══════════════════════════════════════════════════════════
+// AUTH — INVITE (create + verify) — for logged-in users
+// ══════════════════════════════════════════════════════════
+app.post('/api/auth/invite', authMiddleware, async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  const emailLower = email.toLowerCase();
+  if (!domainOk(emailLower)) return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} emails allowed` });
+  const users = await readJson(DB.usersFile);
+  if (users[emailLower]) return res.status(409).json({ error: 'User already exists with this email' });
+
+  const invites = await readJson(DB.invitesFile);
+  // Check for existing non-expired invite
+  const existing = Object.entries(invites).find(([, v]) => v.email === emailLower && Date.now() < v.expiresAt);
+  if (existing) {
+    const inviteUrl = `${CONFIG.appBaseUrl}?invite=${existing[0]}`;
+    return res.json({ ok: true, inviteUrl, expiresAt: invites[existing[0]].expiresAt, reused: true });
+  }
+
+  const token = createToken();
+  invites[token] = {
+    email: emailLower,
+    invitedBy: req.user.email,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + CONFIG.inviteExpiryMs
+  };
+  await writeJson(DB.invitesFile, invites);
+  const inviteUrl = `${CONFIG.appBaseUrl}?invite=${token}`;
+  console.log(`[invite] ${req.user.email} invited ${emailLower} → ${inviteUrl}`);
+  res.json({ ok: true, inviteUrl, expiresAt: invites[token].expiresAt });
+});
+
+app.get('/api/auth/invite/:token', async (req, res) => {
+  const invites = await readJson(DB.invitesFile);
+  const invite = invites[req.params.token];
+  if (!invite) return res.status(404).json({ error: 'Invalid invite link' });
+  if (Date.now() > invite.expiresAt) {
+    delete invites[req.params.token];
+    await writeJson(DB.invitesFile, invites);
+    return res.status(410).json({ error: 'Invite link has expired' });
+  }
+  res.json({ email: invite.email, invitedBy: invite.invitedBy, expiresAt: invite.expiresAt });
+});
+
+// ══════════════════════════════════════════════════════════
+// AUTH — LOGOUT / ME / PROFILE / PASSWORD
+// ══════════════════════════════════════════════════════════
 app.post('/api/auth/logout', authMiddleware, async (req, res) => {
   const sessions = await readJson(DB.sessionsFile);
   delete sessions[req.token];
@@ -319,11 +536,29 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
   res.json({ user: publicUser });
 });
 
+app.put('/api/auth/profile', authMiddleware, async (req, res) => {
+  const { firstName, lastName, org, role, phone, bio, avatar } = req.body || {};
+  const users = await readJson(DB.usersFile);
+  const user = users[req.user.email];
+  if (firstName) user.firstName = firstName;
+  if (lastName) user.lastName = lastName;
+  if (firstName && lastName) {
+    user.fullName = `${firstName} ${lastName}`;
+    user.initials = (firstName[0] + lastName[0]).toUpperCase();
+  }
+  if (org !== undefined) user.org = org;
+  if (role !== undefined) user.role = role;
+  if (phone !== undefined) user.phone = phone;
+  if (bio !== undefined) user.bio = bio;
+  if (avatar !== undefined) user.avatar = avatar;
+  await writeJson(DB.usersFile, users);
+  const { passwordHash, ...publicUser } = user;
+  res.json({ user: publicUser });
+});
+
 app.post('/api/auth/password', authMiddleware, async (req, res) => {
   const { oldPassword, newPassword } = req.body || {};
-  if (!oldPassword || !newPassword) {
-    return res.status(400).json({ error: 'Both old and new password required' });
-  }
+  if (!oldPassword || !newPassword) return res.status(400).json({ error: 'Both old and new password required' });
   const users = await readJson(DB.usersFile);
   const user = users[req.user.email];
   if (!user || user.passwordHash !== hashPassword(oldPassword, req.user.email)) {
@@ -337,7 +572,7 @@ app.post('/api/auth/password', authMiddleware, async (req, res) => {
   }
   user.passwordHash = hashPassword(newPassword, req.user.email);
   await writeJson(DB.usersFile, users);
-  // Invalidate all existing sessions except current one (security best practice)
+  // Invalidate all existing sessions except current
   const sessions = await readJson(DB.sessionsFile);
   Object.keys(sessions).forEach(t => {
     if (sessions[t].email === req.user.email && t !== req.token) delete sessions[t];
@@ -346,6 +581,34 @@ app.post('/api/auth/password', authMiddleware, async (req, res) => {
   res.json({ ok: true, message: 'Password updated successfully' });
 });
 
+// ══════════════════════════════════════════════════════════
+// STATS DASHBOARD
+// ══════════════════════════════════════════════════════════
+app.get('/api/stats/dashboard', authMiddleware, async (req, res) => {
+  const stats = await readJson(DB.statsFile, { global: {}, byUser: {} });
+  const myStats = stats.byUser[req.user.email] || { testPlans: 0, testCases: 0, autoScripts: 0, history: [] };
+  const globalStats = stats.global || { testPlans: 0, testCases: 0, autoScripts: 0 };
+
+  // Aggregate all-user history for chart
+  const allHistory = [];
+  Object.values(stats.byUser || {}).forEach(u => (u.history || []).forEach(h => allHistory.push(h)));
+
+  const chart = buildChartData(allHistory);
+
+  // Also count registered users
+  const users = await readJson(DB.usersFile);
+  const totalUsers = Object.keys(users).length;
+
+  res.json({
+    my: { testPlans: myStats.testPlans || 0, testCases: myStats.testCases || 0, autoScripts: myStats.autoScripts || 0 },
+    global: { testPlans: globalStats.testPlans || 0, testCases: globalStats.testCases || 0, autoScripts: globalStats.autoScripts || 0, users: totalUsers },
+    chart
+  });
+});
+
+// ══════════════════════════════════════════════════════════
+// CONNECTORS
+// ══════════════════════════════════════════════════════════
 app.get('/api/connectors/status', authMiddleware, async (req, res) => {
   const all = await readJson(DB.connectorsFile);
   const mine = all[req.user.email] || {};
@@ -411,6 +674,9 @@ app.delete('/api/connectors/:id', authMiddleware, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ══════════════════════════════════════════════════════════
+// TEST PLAN — GENERATE (with stats recording)
+// ══════════════════════════════════════════════════════════
 app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
   const { projectName, release, epics, context } = req.body || {};
   if (!projectName || !Array.isArray(epics) || epics.length === 0) return res.status(400).json({ error: 'projectName and non-empty epics[] required' });
@@ -420,7 +686,7 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering on Render
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   const send = (event, data) => {
@@ -432,7 +698,6 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
   const log = (msg, level = 'info') => send('log', { msg, level, ts: Date.now() });
   const phase = (idx, state, sub) => send('phase', { idx, state, sub });
 
-  // Heartbeat keeps the SSE connection alive through proxies
   const heartbeat = setInterval(() => {
     try { res.write(': heartbeat\n\n'); } catch (e) {}
   }, 15000);
@@ -534,6 +799,10 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     if (!index[req.user.email]) index[req.user.email] = [];
     index[req.user.email].push({ planId, project: projectName, epics, summaryFile, generatedAt: summary.generatedAt });
     await writeJson(DB.planIndexFile, index);
+
+    // Record stat
+    try { await recordStat(req.user.email, 'testPlans'); } catch (e) { console.error('stat record failed:', e.message); }
+
     phase(5, 'active', 'synthesizing');
     phase(5, 'done', 'complete');
     log(`╚═══ GENERATION COMPLETE ═══`, 'ok');
@@ -576,12 +845,17 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
   res.json({ plans: mine.sort((a, b) => (b.generatedAt > a.generatedAt ? 1 : -1)) });
 });
 
+// ══════════════════════════════════════════════════════════
+// HEALTH
+// ══════════════════════════════════════════════════════════
 app.get('/api/health', (_req, res) => {
   res.json({
-    ok: true, service: 'qubit-server', version: '1.1.0',
+    ok: true, service: 'qubit-server', version: '1.2.0',
     uptimeSec: Math.round(process.uptime()),
     config: {
       allowedDomains: CONFIG.allowedDomains,
+      googleClientId: CONFIG.googleClientId || null,
+      googleSsoEnabled: !!CONFIG.googleClientId,
       mcpTimeout: CONFIG.mcp.timeout,
       mcpMaxRetries: CONFIG.mcp.maxRetries,
       mcpParallelWorkers: CONFIG.mcp.parallelWorkers,
@@ -597,8 +871,10 @@ app.use((err, _req, res, _next) => {
 
 app.listen(CONFIG.port, '0.0.0.0', () => {
   console.log('─────────────────────────────────────');
-  console.log('  Qubit Server v1.1.0 listening on port', CONFIG.port);
-  console.log('  Jira API: /rest/api/3/search/jql (new endpoint)');
+  console.log('  Qubit Server v1.2.0 listening on port', CONFIG.port);
+  console.log('  Jira API: /rest/api/3/search/jql');
+  console.log('  Google SSO:', CONFIG.googleClientId ? 'enabled' : 'disabled (set GOOGLE_CLIENT_ID)');
+  console.log('  App Base URL:', CONFIG.appBaseUrl);
   console.log('  Data dir:', CONFIG.dataDir);
   console.log('  Temp dir:', CONFIG.tempDir);
   console.log('  Allowed domains:', CONFIG.allowedDomains.join(', '));
