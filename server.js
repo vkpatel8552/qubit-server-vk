@@ -398,10 +398,10 @@ function extractAcceptanceCriteria(descText) {
   const bullets = [];
   let inAcSection = false;
   for (const line of lines) {
-    if (/^(acceptance criteria|requirements|ac:|scenarios)/i.test(line)) { inAcSection = true; continue; }
+    if (/^(acceptance criteria|requirements|ac:|scenarios|given|when|then|definition of done)/i.test(line)) { inAcSection = true; continue; }
     if (inAcSection) {
-      if (/^(#|##|background|notes?|open questions|out of scope)/i.test(line)) { inAcSection = false; continue; }
-      const m = line.match(/^[•\-\*]\s*(.+)/) || line.match(/^\d+\.\s*(.+)/);
+      if (/^(#|##|background|notes?|open questions|out of scope|implementation|technical)/i.test(line)) { inAcSection = false; continue; }
+      const m = line.match(/^[•\-\*]\s*(.+)/) || line.match(/^\d+[\.\)]\s*(.+)/);
       if (m) bullets.push(m[1].trim());
     }
   }
@@ -409,10 +409,10 @@ function extractAcceptanceCriteria(descText) {
     for (const line of lines) {
       const m = line.match(/^[•\-\*]\s*(.{15,})/);
       if (m) bullets.push(m[1].trim());
-      if (bullets.length >= 8) break;
+      if (bullets.length >= 12) break;
     }
   }
-  return bullets.slice(0, 10);
+  return bullets.slice(0, 15);
 }
 
 async function fetchStoriesParallel(client, stories, onLog) {
@@ -428,13 +428,13 @@ async function fetchStoriesParallel(client, stories, onLog) {
       if (onLog) onLog(`  worker-${workerId} → fetching ${story.key}`);
       try {
         const detail = await client.withRetry(`getIssue(${story.key})`,
-          () => client.getIssue(story.key, ['summary', 'description', 'status']),
+          () => client.getIssue(story.key, ['summary', 'description', 'status', 'priority', 'assignee']),
           CONFIG.mcp.maxRetries, onLog);
         const descText = adfToPlainText(detail.fields.description);
         results[i] = {
           id: detail.key,
           title: detail.fields.summary,
-          desc: descText.slice(0, 500),
+          desc: descText.slice(0, 3000),   // full description for meaningful scenario generation
           ac: extractAcceptanceCriteria(descText)
         };
         if (onLog) onLog(`  worker-${workerId} ✓ ${story.key} (${i + 1}/${stories.length})`, 'ok');
