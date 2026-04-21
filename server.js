@@ -150,8 +150,19 @@ class AtlassianClient {
     const fieldParam = fields ? `?fields=${fields.join(',')}` : '';
     return this._request('GET', `/rest/api/3/issue/${issueKey}${fieldParam}`);
   }
-  async searchByJql(jql, fields = ['summary', 'status', 'issuetype'], maxResults = 100) {
-    return this._request('POST', '/rest/api/3/search', { jql, fields, maxResults });
+ async searchByJql(jql, fields = ['summary', 'status', 'issuetype'], maxResults = 100) {
+    // Use new /rest/api/3/search/jql endpoint (old /search deprecated by Atlassian Aug 2025)
+    const allIssues = [];
+    let nextPageToken = null;
+    do {
+      const payload = { jql, fields, maxResults };
+      if (nextPageToken) payload.nextPageToken = nextPageToken;
+      const res = await this._request('POST', '/rest/api/3/search/jql', payload);
+      if (Array.isArray(res.issues)) allIssues.push(...res.issues);
+      nextPageToken = res.nextPageToken || null;
+      if (res.isLast === true) break;
+    } while (nextPageToken && allIssues.length < maxResults * 10);
+    return { issues: allIssues };
   }
 }
 
