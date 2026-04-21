@@ -1,6 +1,6 @@
 /**
  * qubit-server — Backend proxy for the Qubit QA platform
- * Updated: stats tracking, invite-based registration, Google SSO, password change
+ * Email: Mailgun HTTP API (no extra packages — uses built-in https)
  */
 
 'use strict';
@@ -23,12 +23,21 @@ const CONFIG = {
   allowedDomains: (process.env.ALLOWED_DOMAINS || 'clearlyrated.com,thoughtminds.io').split(','),
   corsOrigin: process.env.CORS_ORIGIN || '*',
   googleClientId: process.env.GOOGLE_CLIENT_ID || '',
-  inviteExpiryMs: 7 * 24 * 60 * 60 * 1000, // 7 days
-  appBaseUrl: process.env.APP_BASE_URL || 'http://localhost:4000',
+  // Where your index.html is hosted (Netlify, Vercel, etc.)
+  frontendUrl: (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, ''),
+  // Mailgun config — set these as environment variables in Render
+  mailgun: {
+    apiKey:  process.env.MAILGUN_API_KEY  || '',   // Private API Key from Mailgun dashboard
+    domain:  process.env.MAILGUN_DOMAIN   || '',   // e.g. crmail.clearlyrated.com
+    from:    process.env.MAILGUN_FROM     || 'Qubit QA Platform <noreply@mg.clearlyrated.com>',
+    region:  process.env.MAILGUN_REGION   || 'us', // 'us' or 'eu'
+  },
+  inviteExpiryMs:   7 * 24 * 60 * 60 * 1000,   // 7 days  (team invite)
+  regTokenExpiryMs: 24 * 60 * 60 * 1000,        // 24 hours (self-registration)
   mcp: {
-    timeout: parseInt(process.env.MCP_TIMEOUT_MS || '300000', 10),
-    maxRetries: parseInt(process.env.MCP_MAX_RETRIES || '5', 10),
-    parallelWorkers: parseInt(process.env.MCP_PARALLEL_WORKERS || '3', 10),
+    timeout:         parseInt(process.env.MCP_TIMEOUT_MS       || '300000', 10),
+    maxRetries:      parseInt(process.env.MCP_MAX_RETRIES      || '5',      10),
+    parallelWorkers: parseInt(process.env.MCP_PARALLEL_WORKERS || '3',      10),
   }
 };
 
@@ -37,12 +46,12 @@ const CONFIG = {
 });
 
 const DB = {
-  usersFile: path.join(CONFIG.dataDir, 'users.json'),
+  usersFile:    path.join(CONFIG.dataDir, 'users.json'),
   sessionsFile: path.join(CONFIG.dataDir, 'sessions.json'),
   connectorsFile: path.join(CONFIG.dataDir, 'connectors.json'),
-  planIndexFile: path.join(CONFIG.dataDir, 'plan-index.json'),
-  statsFile: path.join(CONFIG.dataDir, 'stats.json'),
-  invitesFile: path.join(CONFIG.dataDir, 'invites.json')
+  planIndexFile:  path.join(CONFIG.dataDir, 'plan-index.json'),
+  statsFile:    path.join(CONFIG.dataDir, 'stats.json'),
+  invitesFile:  path.join(CONFIG.dataDir, 'invites.json')
 };
 
 async function readJson(file, fallback = {}) {
@@ -53,6 +62,156 @@ async function writeJson(file, data) {
   await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
   await fs.rename(tmp, file);
 }
+
+// ─── Mailgun HTTP API (no npm package needed) ─────────────────────────────────
+function sendMailgunEmail({ to, subject, html, text }) {
+  return new Promise((resolve, reject) => {
+    const { apiKey, domain, from, region } = CONFIG.mailgun;
+    if (!apiKey || !domain) {
+      return reject(new Error(
+        'Mailgun is not configured. Add MAILGUN_API_KEY and MAILGUN_DOMAIN ' +
+        'to your Render environment variables.'
+      ));
+    }
+
+    // Build URL-encoded form body (Mailgun messages API)
+    const params = new URLSearchParams({ from, to, subject, text, html });
+    const body = params.toString();
+
+    const hostname = region === 'eu' ? 'api.eu.mailgun.net' : 'api.mailgun.net';
+    const auth     = Buffer.from(`api:${apiKey}`).toString('base64');
+
+    const options = {
+      hostname,
+      path:   `/v3/${domain}/messages`,
+      method: 'POST',
+      headers: {
+        'Authorization':  `Basic ${auth}`,
+        'Content-Type':   'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+      timeout: 15000,
+    };
+
+    const req = https.request(options, res => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve(JSON.parse(raw)); } catch { resolve({ id: 'sent' }); }
+        } else {
+          reject(new Error(`Mailgun API error ${res.statusCode}: ${raw.slice(0, 300)}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Mailgun request timed out')); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── Registration email template ─────────────────────────────────────────────
+function buildRegistrationEmail(toEmail, registrationUrl) {
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Complete your Qubit registration</title></head>
+<body style="margin:0;padding:0;background:#f2f3fb;font-family:'Segoe UI',Arial,sans-serif;-webkit-font-smoothing:antialiased">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f2f3fb;padding:40px 16px">
+  <tr><td align="center">
+    <table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.10)">
+
+      <!-- Header -->
+      <tr><td style="background:linear-gradient(135deg,#7c3aed 0%,#a855f7 55%,#ec4899 100%);padding:36px 40px 28px;text-align:center">
+        <table cellpadding="0" cellspacing="0" style="margin:0 auto 18px">
+          <tr><td style="width:56px;height:56px;background:rgba(255,255,255,.18);border-radius:14px;text-align:center;vertical-align:middle;font-size:28px">&#128737;</td></tr>
+        </table>
+        <h1 style="color:#ffffff;font-size:24px;font-weight:800;margin:0 0 6px;letter-spacing:-.3px">Qubit QA Platform</h1>
+        <p style="color:rgba(255,255,255,.85);font-size:14px;margin:0;font-weight:500">Intelligent Test Planning</p>
+      </td></tr>
+
+      <!-- Body -->
+      <tr><td style="padding:40px 40px 32px">
+        <h2 style="color:#0f1017;font-size:20px;font-weight:800;margin:0 0 10px;letter-spacing:-.2px">Complete your registration</h2>
+        <p style="color:#5c6278;font-size:14.5px;line-height:1.65;margin:0 0 28px">
+          Hi there,<br><br>
+          You requested to create a <strong style="color:#0f1017">Qubit QA Platform</strong> account for
+          <strong style="color:#7c3aed">${toEmail}</strong>.
+          Click the button below to complete your setup &mdash; it only takes a minute.
+        </p>
+
+        <!-- CTA Button -->
+        <table cellpadding="0" cellspacing="0" width="100%">
+          <tr><td align="center" style="padding:4px 0 32px">
+            <a href="${registrationUrl}"
+               style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;font-size:15px;font-weight:700;padding:15px 40px;border-radius:10px;box-shadow:0 4px 18px rgba(124,58,237,.35);letter-spacing:.1px">
+              Complete Registration &rarr;
+            </a>
+          </td></tr>
+        </table>
+
+        <!-- Info box -->
+        <table cellpadding="0" cellspacing="0" width="100%" style="background:#f8f7ff;border:1px solid rgba(124,58,237,.14);border-radius:10px">
+          <tr><td style="padding:18px 22px">
+            <p style="font-size:13px;color:#5c6278;margin:0 0 8px"><strong style="color:#7c3aed">&#9200; Expires in:</strong>&nbsp; 24 hours</p>
+            <p style="font-size:13px;color:#5c6278;margin:0 0 8px"><strong style="color:#7c3aed">&#128231; For email:</strong>&nbsp; ${toEmail}</p>
+            <p style="font-size:13px;color:#5c6278;margin:0"><strong style="color:#7c3aed">&#128274; One-time use:</strong>&nbsp; Link is invalidated after registration</p>
+          </td></tr>
+        </table>
+
+        <p style="color:#9498b0;font-size:12.5px;line-height:1.65;margin:24px 0 0">
+          Didn&apos;t request this? You can safely ignore this email &mdash; no account will be created without completing registration.
+        </p>
+        <p style="color:#9498b0;font-size:12px;line-height:1.65;margin:12px 0 0;word-break:break-all">
+          Button not working? Paste this link into your browser:<br>
+          <a href="${registrationUrl}" style="color:#7c3aed">${registrationUrl}</a>
+        </p>
+      </td></tr>
+
+      <!-- Footer -->
+      <tr><td style="background:#f8f7ff;border-top:1px solid #ebe9f8;padding:20px 40px;text-align:center">
+        <p style="color:#9498b0;font-size:12px;margin:0 0 4px;font-weight:600">Qubit QA Platform</p>
+        <p style="color:#b8bcd0;font-size:11.5px;margin:0">This is an automated message &mdash; please do not reply.</p>
+      </td></tr>
+
+    </table>
+    <p style="color:#b8bcd0;font-size:11px;text-align:center;margin:16px 0 0">&copy; ${new Date().getFullYear()} Qubit QA Platform. All rights reserved.</p>
+  </td></tr>
+</table>
+</body>
+</html>`;
+
+  const text = [
+    'Complete your Qubit QA Platform registration',
+    '',
+    `Hi,`,
+    '',
+    `You requested to create a Qubit account for ${toEmail}.`,
+    `Click the link below to complete registration (expires in 24 hours):`,
+    '',
+    registrationUrl,
+    '',
+    "If you didn't request this, you can safely ignore this email.",
+    '',
+    '— Qubit QA Platform',
+  ].join('\n');
+
+  return { html, text };
+}
+
+async function sendRegistrationEmail(toEmail, registrationUrl) {
+  const { html, text } = buildRegistrationEmail(toEmail, registrationUrl);
+  const result = await sendMailgunEmail({
+    to:      toEmail,
+    subject: 'Complete your Qubit registration',
+    html,
+    text,
+  });
+  console.log(`[mailgun] Registration email sent → ${toEmail} (id: ${result.id || 'ok'})`);
+  return result;
+}
+
 
 function hashPassword(pwd, email) {
   return crypto.createHash('sha256').update(pwd + '|qubit-server|' + email.toLowerCase()).digest('hex');
@@ -438,31 +597,52 @@ app.post('/api/auth/google', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════
-// AUTH — SELF-SERVICE REGISTRATION REQUEST
+// AUTH — SELF-SERVICE REGISTRATION REQUEST (sends real email)
 // ══════════════════════════════════════════════════════════
 app.post('/api/auth/request-register', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email required' });
-  const emailLower = email.toLowerCase();
-  if (!domainOk(emailLower)) return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} emails allowed` });
+  const emailLower = email.toLowerCase().trim();
+  if (!domainOk(emailLower)) {
+    return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} emails are allowed` });
+  }
   const users = await readJson(DB.usersFile);
-  if (users[emailLower]) return res.status(409).json({ error: 'An account already exists for this email. Please sign in.' });
-
-  const invites = await readJson(DB.invitesFile);
-  // Reuse existing non-expired token for same email
-  const existing = Object.entries(invites).find(([, v]) => v.email === emailLower && Date.now() < v.expiresAt);
-  if (existing) {
-    const registrationUrl = `${CONFIG.appBaseUrl}?register=${existing[0]}`;
-    return res.json({ ok: true, registrationUrl, expiresAt: invites[existing[0]].expiresAt });
+  if (users[emailLower]) {
+    return res.status(409).json({ error: 'An account already exists for this email. Please sign in.' });
   }
 
-  const token = createToken();
-  const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours for self-registration
-  invites[token] = { email: emailLower, invitedBy: null, createdAt: Date.now(), expiresAt };
-  await writeJson(DB.invitesFile, invites);
-  const registrationUrl = `${CONFIG.appBaseUrl}?register=${token}`;
-  console.log(`[register-request] ${emailLower} → ${registrationUrl}`);
-  res.json({ ok: true, registrationUrl, expiresAt });
+  // Reuse existing non-expired token for same email
+  const invites = await readJson(DB.invitesFile);
+  let token = null;
+  const existing = Object.entries(invites).find(([, v]) => v.email === emailLower && Date.now() < v.expiresAt);
+  if (existing) {
+    token = existing[0];
+  } else {
+    token = createToken();
+    invites[token] = {
+      email: emailLower,
+      invitedBy: null,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + CONFIG.regTokenExpiryMs
+    };
+    await writeJson(DB.invitesFile, invites);
+  }
+
+  const registrationUrl = `${CONFIG.frontendUrl}/?register=${token}`;
+
+  try {
+    await sendRegistrationEmail(emailLower, registrationUrl);
+    console.log(`[register] Email dispatched → ${emailLower}`);
+    res.json({ ok: true, email: emailLower });
+  } catch (err) {
+    console.error('[register] Email send failed:', err.message);
+    // Tell the client exactly what is misconfigured
+    res.status(500).json({
+      error: 'Failed to send registration email.',
+      detail: err.message,
+      setup: 'Configure SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, and FRONTEND_URL in your environment variables.'
+    });
+  }
 });
 
 app.get('/api/auth/register-token/:token', async (req, res) => {
@@ -492,7 +672,7 @@ app.post('/api/auth/invite', authMiddleware, async (req, res) => {
   // Check for existing non-expired invite
   const existing = Object.entries(invites).find(([, v]) => v.email === emailLower && Date.now() < v.expiresAt);
   if (existing) {
-    const inviteUrl = `${CONFIG.appBaseUrl}?invite=${existing[0]}`;
+    const inviteUrl = `${CONFIG.frontendUrl}/?register=${existing[0]}`;
     return res.json({ ok: true, inviteUrl, expiresAt: invites[existing[0]].expiresAt, reused: true });
   }
 
@@ -504,7 +684,7 @@ app.post('/api/auth/invite', authMiddleware, async (req, res) => {
     expiresAt: Date.now() + CONFIG.inviteExpiryMs
   };
   await writeJson(DB.invitesFile, invites);
-  const inviteUrl = `${CONFIG.appBaseUrl}?invite=${token}`;
+  const inviteUrl = `${CONFIG.frontendUrl}/?register=${token}`;
   console.log(`[invite] ${req.user.email} invited ${emailLower} → ${inviteUrl}`);
   res.json({ ok: true, inviteUrl, expiresAt: invites[token].expiresAt });
 });
@@ -871,12 +1051,11 @@ app.use((err, _req, res, _next) => {
 
 app.listen(CONFIG.port, '0.0.0.0', () => {
   console.log('─────────────────────────────────────');
-  console.log('  Qubit Server v1.2.0 listening on port', CONFIG.port);
-  console.log('  Jira API: /rest/api/3/search/jql');
-  console.log('  Google SSO:', CONFIG.googleClientId ? 'enabled' : 'disabled (set GOOGLE_CLIENT_ID)');
-  console.log('  App Base URL:', CONFIG.appBaseUrl);
-  console.log('  Data dir:', CONFIG.dataDir);
-  console.log('  Temp dir:', CONFIG.tempDir);
+  console.log('  Qubit Server v1.2.0  |  port', CONFIG.port);
+  console.log('  Frontend URL :', CONFIG.frontendUrl);
+  console.log('  Mailgun      :', CONFIG.mailgun.apiKey ? `configured (domain: ${CONFIG.mailgun.domain})` : '⚠ NOT configured — set MAILGUN_API_KEY + MAILGUN_DOMAIN');
+  console.log('  Google SSO   :', CONFIG.googleClientId ? 'enabled' : 'disabled (set GOOGLE_CLIENT_ID)');
+  console.log('  Data dir     :', CONFIG.dataDir);
   console.log('  Allowed domains:', CONFIG.allowedDomains.join(', '));
   console.log('─────────────────────────────────────');
 });
