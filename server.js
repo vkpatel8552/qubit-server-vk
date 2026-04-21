@@ -1,39 +1,40 @@
 /**
  * qubit-server — Backend proxy for the Qubit QA platform
- * Email: Mailgun HTTP API (no extra packages — uses built-in https)
+ * Email: Mailgun SMTP via nodemailer (smtp.mailgun.org, username + password)
  */
 
 'use strict';
 
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const fs = require('fs').promises;
-const fsSync = require('fs');
-const path = require('path');
-const https = require('https');
+const express    = require('express');
+const cors       = require('cors');
+const crypto     = require('crypto');
+const fs         = require('fs').promises;
+const fsSync     = require('fs');
+const path       = require('path');
+const https      = require('https');
+const nodemailer = require('nodemailer');
 
 require('dotenv').config();
 
 const CONFIG = {
-  port: process.env.PORT || 4000,
-  dataDir: process.env.DATA_DIR || path.join(__dirname, 'data'),
-  tempDir: process.env.TEMP_DIR || path.join(__dirname, 'tmp'),
-  jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
+  port:           process.env.PORT     || 4000,
+  dataDir:        process.env.DATA_DIR || path.join(__dirname, 'data'),
+  tempDir:        process.env.TEMP_DIR || path.join(__dirname, 'tmp'),
+  jwtSecret:      process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
   allowedDomains: (process.env.ALLOWED_DOMAINS || 'clearlyrated.com,thoughtminds.io').split(','),
-  corsOrigin: process.env.CORS_ORIGIN || '*',
+  corsOrigin:     process.env.CORS_ORIGIN || '*',
   googleClientId: process.env.GOOGLE_CLIENT_ID || '',
-  // Where your index.html is hosted (Netlify, Vercel, etc.)
-  frontendUrl: (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, ''),
-  // Mailgun config — set these as environment variables in Render
-  mailgun: {
-    apiKey:  process.env.MAILGUN_API_KEY  || '',   // Private API Key from Mailgun dashboard
-    domain:  process.env.MAILGUN_DOMAIN   || '',   // e.g. crmail.clearlyrated.com
-    from:    process.env.MAILGUN_FROM     || 'Qubit QA Platform <noreply@mg.clearlyrated.com>',
-    region:  process.env.MAILGUN_REGION   || 'us', // 'us' or 'eu'
+  frontendUrl:    (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, ''),
+  // Mailgun SMTP — set these 4 vars in Render environment
+  smtp: {
+    host: 'smtp.mailgun.org',
+    port: 587,
+    user: process.env.SMTP_USER || '',   // Mailgun SMTP login   e.g. qa@crmail.clearlyrated.com
+    pass: process.env.SMTP_PASS || '',   // Mailgun SMTP password
+    from: process.env.SMTP_FROM || 'Qubit QA Platform <noreply@qubit.io>',
   },
-  inviteExpiryMs:   7 * 24 * 60 * 60 * 1000,   // 7 days  (team invite)
-  regTokenExpiryMs: 24 * 60 * 60 * 1000,        // 24 hours (self-registration)
+  inviteExpiryMs:   7 * 24 * 60 * 60 * 1000,
+  regTokenExpiryMs: 24 * 60 * 60 * 1000,
   mcp: {
     timeout:         parseInt(process.env.MCP_TIMEOUT_MS       || '300000', 10),
     maxRetries:      parseInt(process.env.MCP_MAX_RETRIES      || '5',      10),
@@ -46,12 +47,12 @@ const CONFIG = {
 });
 
 const DB = {
-  usersFile:    path.join(CONFIG.dataDir, 'users.json'),
-  sessionsFile: path.join(CONFIG.dataDir, 'sessions.json'),
+  usersFile:      path.join(CONFIG.dataDir, 'users.json'),
+  sessionsFile:   path.join(CONFIG.dataDir, 'sessions.json'),
   connectorsFile: path.join(CONFIG.dataDir, 'connectors.json'),
   planIndexFile:  path.join(CONFIG.dataDir, 'plan-index.json'),
-  statsFile:    path.join(CONFIG.dataDir, 'stats.json'),
-  invitesFile:  path.join(CONFIG.dataDir, 'invites.json')
+  statsFile:      path.join(CONFIG.dataDir, 'stats.json'),
+  invitesFile:    path.join(CONFIG.dataDir, 'invites.json')
 };
 
 async function readJson(file, fallback = {}) {
@@ -63,51 +64,20 @@ async function writeJson(file, data) {
   await fs.rename(tmp, file);
 }
 
-// ─── Mailgun HTTP API (no npm package needed) ─────────────────────────────────
-function sendMailgunEmail({ to, subject, html, text }) {
-  return new Promise((resolve, reject) => {
-    const { apiKey, domain, from, region } = CONFIG.mailgun;
-    if (!apiKey || !domain) {
-      return reject(new Error(
-        'Mailgun is not configured. Add MAILGUN_API_KEY and MAILGUN_DOMAIN ' +
-        'to your Render environment variables.'
-      ));
-    }
-
-    // Build URL-encoded form body (Mailgun messages API)
-    const params = new URLSearchParams({ from, to, subject, text, html });
-    const body = params.toString();
-
-    const hostname = region === 'eu' ? 'api.eu.mailgun.net' : 'api.mailgun.net';
-    const auth     = Buffer.from(`api:${apiKey}`).toString('base64');
-
-    const options = {
-      hostname,
-      path:   `/v3/${domain}/messages`,
-      method: 'POST',
-      headers: {
-        'Authorization':  `Basic ${auth}`,
-        'Content-Type':   'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body),
-      },
-      timeout: 15000,
-    };
-
-    const req = https.request(options, res => {
-      let raw = '';
-      res.on('data', c => { raw += c; });
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try { resolve(JSON.parse(raw)); } catch { resolve({ id: 'sent' }); }
-        } else {
-          reject(new Error(`Mailgun API error ${res.statusCode}: ${raw.slice(0, 300)}`));
-        }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Mailgun request timed out')); });
-    req.write(body);
-    req.end();
+// ─── Mailgun SMTP transporter ─────────────────────────────────────────────────
+function createTransporter() {
+  const { host, port, user, pass } = CONFIG.smtp;
+  if (!user || !pass) {
+    throw new Error(
+      'SMTP not configured. Set SMTP_USER and SMTP_PASS in Render environment variables.'
+    );
+  }
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: false,             // STARTTLS on port 587
+    auth: { user, pass },
+    tls:  { rejectUnauthorized: false },
   });
 }
 
@@ -185,10 +155,10 @@ function buildRegistrationEmail(toEmail, registrationUrl) {
   const text = [
     'Complete your Qubit QA Platform registration',
     '',
-    `Hi,`,
+    'Hi,',
     '',
     `You requested to create a Qubit account for ${toEmail}.`,
-    `Click the link below to complete registration (expires in 24 hours):`,
+    'Click the link below to complete registration (expires in 24 hours):',
     '',
     registrationUrl,
     '',
@@ -201,16 +171,19 @@ function buildRegistrationEmail(toEmail, registrationUrl) {
 }
 
 async function sendRegistrationEmail(toEmail, registrationUrl) {
+  const transporter = createTransporter();
   const { html, text } = buildRegistrationEmail(toEmail, registrationUrl);
-  const result = await sendMailgunEmail({
+  const info = await transporter.sendMail({
+    from:    CONFIG.smtp.from,
     to:      toEmail,
     subject: 'Complete your Qubit registration',
-    html,
     text,
+    html,
   });
-  console.log(`[mailgun] Registration email sent → ${toEmail} (id: ${result.id || 'ok'})`);
-  return result;
+  console.log(`[smtp] Registration email sent → ${toEmail} (messageId: ${info.messageId})`);
+  return info;
 }
+
 
 
 function hashPassword(pwd, email) {
@@ -1030,18 +1003,17 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 // HEALTH
 // ══════════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════
-// MAILGUN DIAGNOSTIC — GET /api/test/mailgun?to=you@domain.com
-// Open this URL in your browser to verify Mailgun is working
+// SMTP DIAGNOSTIC — GET /api/test/mailgun?to=you@domain.com
 // ══════════════════════════════════════════════════════════
 app.get('/api/test/mailgun', async (req, res) => {
-  const cfg = CONFIG.mailgun;
+  const { host, port, user, pass, from } = CONFIG.smtp;
   const checks = {
-    MAILGUN_API_KEY:  cfg.apiKey  ? `✓ set (${cfg.apiKey.slice(0,6)}…)` : '✗ NOT SET',
-    MAILGUN_DOMAIN:   cfg.domain  ? `✓ ${cfg.domain}` : '✗ NOT SET',
-    MAILGUN_FROM:     cfg.from    ? `✓ ${cfg.from}`   : '✗ NOT SET',
-    MAILGUN_REGION:   cfg.region  || 'us (default)',
-    FRONTEND_URL:     CONFIG.frontendUrl,
-    api_endpoint:     `https://api${cfg.region==='eu'?'.eu':''}.mailgun.net/v3/${cfg.domain}/messages`,
+    SMTP_HOST: `smtp.mailgun.org (hardcoded)`,
+    SMTP_PORT: `587 (hardcoded)`,
+    SMTP_USER: user ? `✓ set (${user})` : '✗ NOT SET',
+    SMTP_PASS: pass ? `✓ set (${pass.slice(0,6)}…)` : '✗ NOT SET',
+    SMTP_FROM: from ? `✓ ${from}` : '✗ NOT SET',
+    FRONTEND_URL: CONFIG.frontendUrl,
   };
 
   if (!req.query.to) {
@@ -1049,20 +1021,28 @@ app.get('/api/test/mailgun', async (req, res) => {
   }
 
   try {
-    const result = await sendMailgunEmail({
+    const transporter = createTransporter();
+    // Verify connection first
+    await transporter.verify();
+    // Send test email
+    const info = await transporter.sendMail({
+      from,
       to:      req.query.to,
-      subject: 'Qubit — Mailgun test email',
-      text:    'If you receive this, Mailgun is configured correctly.',
-      html:    '<p style="font-family:sans-serif">If you receive this, <strong>Mailgun is configured correctly ✓</strong></p>',
+      subject: 'Qubit — SMTP test email',
+      text:    'If you receive this, Mailgun SMTP is configured correctly.',
+      html:    '<p style="font-family:sans-serif;font-size:15px">If you receive this, <strong style="color:#7c3aed">Mailgun SMTP is working correctly ✓</strong></p>',
     });
-    res.json({ status: 'sent', messageId: result.id, to: req.query.to, checks });
+    res.json({ status: 'sent', messageId: info.messageId, to: req.query.to, checks });
   } catch (err) {
-    res.status(500).json({ status: 'failed', error: err.message, checks,
-      fix: err.message.includes('401')
-        ? 'Wrong API key. Use Private API Key from Mailgun → Settings → API Keys (NOT the SMTP password)'
-        : err.message.includes('404') || err.message.includes('domain')
-        ? 'Domain not found. Check MAILGUN_DOMAIN matches exactly what is in your Mailgun account'
-        : 'Check all env vars and try again'
+    res.status(500).json({
+      status: 'failed',
+      error:  err.message,
+      checks,
+      fix: err.message.includes('535') || err.message.includes('auth') || err.message.includes('535')
+        ? 'Authentication failed — check SMTP_USER and SMTP_PASS in Render env vars'
+        : err.message.includes('connect') || err.message.includes('ECONNREFUSED')
+        ? 'Cannot connect to smtp.mailgun.org — check network/firewall'
+        : 'Check SMTP_USER, SMTP_PASS, SMTP_FROM in Render environment variables',
     });
   }
 });
@@ -1092,7 +1072,7 @@ app.listen(CONFIG.port, '0.0.0.0', () => {
   console.log('─────────────────────────────────────');
   console.log('  Qubit Server v1.2.0  |  port', CONFIG.port);
   console.log('  Frontend URL :', CONFIG.frontendUrl);
-  console.log('  Mailgun      :', CONFIG.mailgun.apiKey ? `configured (domain: ${CONFIG.mailgun.domain})` : '⚠ NOT configured — set MAILGUN_API_KEY + MAILGUN_DOMAIN');
+  console.log('  SMTP         : smtp.mailgun.org:587 —', CONFIG.smtp.user ? `user: ${CONFIG.smtp.user}` : '⚠ SMTP_USER not set');
   console.log('  Google SSO   :', CONFIG.googleClientId ? 'enabled' : 'disabled (set GOOGLE_CLIENT_ID)');
   console.log('  Data dir     :', CONFIG.dataDir);
   console.log('  Allowed domains:', CONFIG.allowedDomains.join(', '));
