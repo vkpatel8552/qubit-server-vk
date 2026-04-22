@@ -230,11 +230,68 @@ class AtlassianClient {
   }
   async ping() { return this._req('GET','/rest/api/3/myself'); }
   async getIssue(k,fields) { return this._req('GET',`/rest/api/3/issue/${k}${fields?'?fields='+fields.join(','):''}`); }
+  async getFields() { return this._req('GET','/rest/api/3/field'); }
+  async getChangelog(k) { return this._req('GET',`/rest/api/3/issue/${k}/changelog?maxResults=200`); }
   async searchByJql(jql,fields=['summary','status','issuetype'],maxResults=100) {
     const all=[]; let nextPageToken=null,safety=0;
     do { const p={jql,fields,maxResults}; if(nextPageToken)p.nextPageToken=nextPageToken; const r=await this._req('POST','/rest/api/3/search/jql',p); if(Array.isArray(r.issues))all.push(...r.issues); nextPageToken=r.nextPageToken||null; safety++; if(r.isLast===true||!nextPageToken||safety>=10)break; } while(true);
     return { issues: all };
   }
+}
+
+// ─── Jira field helpers ───────────────────────────────────────────────────────
+let _fieldMapCache = null;
+async function getFieldMap(client) {
+  if (_fieldMapCache) return _fieldMapCache;
+  try {
+    const fields = await client.getFields();
+    const map = {};
+    (Array.isArray(fields) ? fields : []).forEach(f => {
+      if (f.name) map[f.name.toLowerCase()] = f.id;
+      if (f.id && f.name) map[f.id] = f.name;
+    });
+    _fieldMapCache = map;
+    return map;
+  } catch (e) { console.warn('[fields] Could not fetch field mapping:', e.message); return {}; }
+}
+function findField(map, patterns) {
+  for (const p of patterns) {
+    if (map[p]) return map[p];
+    for (const k of Object.keys(map)) { if (k.includes(p) && !k.startsWith('customfield_')) return map[k]; }
+  }
+  return null;
+}
+function resolveUserField(fields, fieldId) {
+  if (!fieldId || !fields[fieldId]) return null;
+  const v = fields[fieldId];
+  if (v && v.displayName) return v.displayName;
+  if (Array.isArray(v) && v[0] && v[0].displayName) return v[0].displayName;
+  return null;
+}
+async function extractEpicRoles(client, epicKey, epicFields, fieldMap) {
+  // Detect EM and QA field IDs from field map
+  const emId = findField(fieldMap, ['engineering manager','engineering_manager','em','eng manager','eng_manager']);
+  const qaId = findField(fieldMap, ['qa validator','qa_validator','quality assurance','tester','qa owner','qa_owner','qa']);
+
+  const engineeringManager = resolveUserField(epicFields, emId) || (epicFields.assignee && epicFields.assignee.displayName) || '—';
+  const qaValidator = resolveUserField(epicFields, qaId) || null;
+
+  // Stakeholders: all unique users from changelog (issue history)
+  const names = new Set();
+  try {
+    const cl = await client.getChangelog(epicKey);
+    (cl.values || []).forEach(entry => {
+      if (entry.author && entry.author.displayName && !/automation|bot|jira/i.test(entry.author.displayName)) {
+        names.add(entry.author.displayName);
+      }
+    });
+  } catch (e) { /* changelog optional */ }
+  // Always include reporter, assignee, EM, QA
+  [epicFields.reporter, epicFields.assignee].forEach(u => { if (u && u.displayName) names.add(u.displayName); });
+  if (engineeringManager !== '—') names.add(engineeringManager);
+  if (qaValidator) names.add(qaValidator);
+
+  return { engineeringManager, qaValidator, stakeholders: Array.from(names) };
 }
 
 function adfToPlainText(adf) {
@@ -409,9 +466,33 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     log(`Project: ${projectName} · Epics: ${epics.join(', ')}`);
     const client=new AtlassianClient({email:jira.jiraEmail,apiToken:jira.apiToken,siteUrl:jira.siteUrl});
     phase(0,'active','');const me=await client.ping();log(`✓ Authenticated as ${me.displayName}`,'ok');phase(0,'done',`✓ ${me.displayName}`);
+
+    // Fetch Jira field mapping once (used for EM and QA detection)
+    let fieldMap = {};
+    try { fieldMap = await getFieldMap(client); log(`✓ Field mapping loaded (${Object.keys(fieldMap).length} fields)`,'ok'); }
+    catch(e) { log(`⚠ Field mapping unavailable: ${e.message}`,'warn'); }
+
     phase(1,'active',`0 of ${epics.length}`);const epicsMeta=[];
-    for(let i=0;i<epics.length;i++){const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority']),CONFIG.mcp.maxRetries,log);const dt=adfToPlainText(epic.fields.description);epicsMeta.push({id,meta:{key:epic.key,title:epic.fields.summary,description:dt.slice(0,800),status:(epic.fields.status&&epic.fields.status.name)||'Unknown',assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',dueDate:epic.fields.duedate||'TBD',priority:(epic.fields.priority&&epic.fields.priority.name)||'Medium'}});log(`✓ Epic loaded: ${epicsMeta[epicsMeta.length-1].meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);}
-    phase(1,'done',`${epics.length} epics fetched`);phase(2,'active','');
+    for(let i=0;i<epics.length;i++){
+      const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);
+      const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority']),CONFIG.mcp.maxRetries,log);
+      const dt=adfToPlainText(epic.fields.description);
+      // Enrich roles from Jira fields + changelog
+      const roles = await extractEpicRoles(client, id, epic.fields, fieldMap);
+      log(`✓ Roles — EM: ${roles.engineeringManager} | QA: ${roles.qaValidator||'—'} | Stakeholders: ${roles.stakeholders.length}`,'ok');
+      epicsMeta.push({id,meta:{
+        key:epic.key,title:epic.fields.summary,description:dt.slice(0,800),
+        status:(epic.fields.status&&epic.fields.status.name)||'Unknown',
+        assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',
+        reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',
+        dueDate:epic.fields.duedate||'TBD',
+        priority:(epic.fields.priority&&epic.fields.priority.name)||'Medium',
+        engineeringManager:roles.engineeringManager,
+        qaValidator:roles.qaValidator,
+        stakeholders:roles.stakeholders
+      }});
+      log(`✓ Epic loaded: ${epicsMeta[epicsMeta.length-1].meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);
+    }    phase(1,'done',`${epics.length} epics fetched`);phase(2,'active','');
     const slbe={};let totalStories=0;
     for(const em of epicsMeta){const jql=`parent in (${em.id}) AND issuetype = Story`;log(`JQL: "${jql}"`);const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const issues=sr.issues||[];slbe[em.id]=issues;log(`✓ ${issues.length} stories for ${em.id}`,'ok');issues.forEach(s=>log(`    • ${s.key} — ${s.fields&&s.fields.summary}`));totalStories+=issues.length;}
     phase(2,'done',`${totalStories} stories found`);if(totalStories===0)log(`⚠ No stories found. Check JQL permissions.`,'warn');
@@ -419,7 +500,24 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     for(const em of epicsMeta){const list=slbe[em.id];const details=list.length>0?await fetchStoriesParallel(client,list,log):[];allEpics.push({id:em.id,meta:em.meta,stories:details});done+=list.length;phase(3,'active',`${done} of ${totalStories}`);}
     phase(3,'done',`${totalStories} stories enriched`);phase(4,'active','saving to database');
     const planId=crypto.randomBytes(8).toString('hex');
-    const summary={id:planId,generatedAt:new Date().toISOString(),generatedBy:req.user.email,generatedByName:req.user.fullName,project:projectName,release:release||'Unscheduled',context:context||'',site:jira.siteUrl,jiraUser:me.displayName,epics:allEpics.map(e=>({epicKey:e.id,epicTitle:e.meta.title,epicDescription:e.meta.description,epicStatus:e.meta.status,epicAssignee:e.meta.assignee,epicReporter:e.meta.reporter,epicDueDate:e.meta.dueDate,stories:e.stories.map(s=>({storyKey:s.id,storyTitle:s.title,description:s.desc,acceptanceCriteria:s.ac}))})),totals:{epics:allEpics.length,stories:totalStories,acceptanceCriteria:allEpics.reduce((a,e)=>a+e.stories.reduce((b,s)=>b+s.ac.length,0),0)}};
+    const firstEpicTitle = allEpics[0] && allEpics[0].meta.title ? allEpics[0].meta.title : '';
+    const displayName = `${projectName}${firstEpicTitle ? ' — ' + firstEpicTitle : ''}`;
+    const summary={
+      id:planId, displayName,
+      generatedAt:new Date().toISOString(),generatedBy:req.user.email,generatedByName:req.user.fullName,
+      project:projectName,release:release||'Unscheduled',context:context||'',
+      site:jira.siteUrl,jiraUser:me.displayName,
+      epics:allEpics.map(e=>({
+        epicKey:e.id, epicTitle:e.meta.title, epicDescription:e.meta.description,
+        epicStatus:e.meta.status, epicAssignee:e.meta.assignee, epicReporter:e.meta.reporter,
+        epicDueDate:e.meta.dueDate,
+        epicEngineeringManager:e.meta.engineeringManager,
+        epicQaValidator:e.meta.qaValidator,
+        epicStakeholders:e.meta.stakeholders,
+        stories:e.stories.map(s=>({storyKey:s.id,storyTitle:s.title,description:s.desc,acceptanceCriteria:s.ac}))
+      })),
+      totals:{epics:allEpics.length,stories:totalStories,acceptanceCriteria:allEpics.reduce((a,e)=>a+e.stories.reduce((b,s)=>b+s.ac.length,0),0)}
+    };
     await savePlan(planId,req.user.email,projectName,release,epics,summary);
     await recordStatEvent(req.user.email,'testPlans');
     log(`✓ Plan saved to database`,'ok');phase(4,'done','saved to database');
