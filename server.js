@@ -66,6 +66,18 @@ async function initDB() {
   await db(`CREATE TABLE IF NOT EXISTS stat_events (id SERIAL PRIMARY KEY, email TEXT NOT NULL, stat_type TEXT NOT NULL, recorded_date DATE NOT NULL DEFAULT CURRENT_DATE, created_at TIMESTAMPTZ DEFAULT NOW())`);
   await db(`CREATE INDEX IF NOT EXISTS idx_stat_events_email ON stat_events(email)`);
   await db(`CREATE INDEX IF NOT EXISTS idx_stat_events_date  ON stat_events(recorded_date)`);
+  await db(`CREATE TABLE IF NOT EXISTS test_cases (
+    tc_id        TEXT PRIMARY KEY,
+    email        TEXT NOT NULL,
+    project      TEXT NOT NULL,
+    release      TEXT,
+    prefix       TEXT NOT NULL,
+    epics        JSONB NOT NULL DEFAULT '[]',
+    cases        JSONB NOT NULL DEFAULT '[]',
+    totals       JSONB,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_test_cases_email ON test_cases(email)`);
   console.log('[db] Tables ready');
 }
 
@@ -121,6 +133,20 @@ async function getPlans(email) {
 async function getPlanSummary(planId, email) {
   const r = await db('SELECT summary FROM test_plans WHERE plan_id=$1 AND email=$2', [planId, email.toLowerCase()]);
   return r.rows[0] ? r.rows[0].summary : null;
+}
+async function saveTestCaseSet(tcId,email,project,release,prefix,epics,cases,totals){
+  await db(`INSERT INTO test_cases(tc_id,email,project,release,prefix,epics,cases,totals,generated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())`,
+    [tcId,email.toLowerCase(),project,release||'Unscheduled',prefix,JSON.stringify(epics),JSON.stringify(cases),JSON.stringify(totals)]);
+}
+async function getTestCasesList(email){
+  const r=await db(`SELECT tc_id,project,release,prefix,epics,generated_at,totals FROM test_cases WHERE email=$1 ORDER BY generated_at DESC`,[email.toLowerCase()]);
+  return r.rows.map(row=>({tcId:row.tc_id,project:row.project,release:row.release,prefix:row.prefix,epics:row.epics,generatedAt:row.generated_at,totals:row.totals}));
+}
+async function getTestCaseSet(tcId,email){
+  const r=await db('SELECT tc_id,project,release,prefix,epics,cases,totals,generated_at FROM test_cases WHERE tc_id=$1 AND email=$2',[tcId,email.toLowerCase()]);
+  if(!r.rows[0])return null;
+  const row=r.rows[0];
+  return{tcId:row.tc_id,project:row.project,release:row.release,prefix:row.prefix,epics:row.epics,cases:row.cases,totals:row.totals,generatedAt:row.generated_at};
 }
 async function recordStatEvent(email, statType) {
   await db('INSERT INTO stat_events(email,stat_type) VALUES($1,$2)', [email.toLowerCase(), statType]);
@@ -536,6 +562,69 @@ app.get('/api/testplan/:id/summary', authMiddleware, async (req, res) => {
 });
 app.get('/api/testplan/list', authMiddleware, async (req, res) => {
   const plans=await getPlans(req.user.email);res.json({plans});
+});
+
+
+// TEST CASE — GENERATE (SSE: fetch Jira data, frontend generates cases)
+app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
+  const {projectName,release,epics,prefix}=req.body||{};
+  if(!projectName||!Array.isArray(epics)||epics.length===0||!prefix)return res.status(400).json({error:'projectName, epics[], and prefix required'});
+  const connData=await getConnectors(req.user.email);const jira=connData.jira;
+  if(!jira||!jira.connected)return res.status(400).json({error:'Jira connector not configured'});
+  res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-cache');res.setHeader('Connection','keep-alive');res.setHeader('X-Accel-Buffering','no');res.flushHeaders();
+  const send=(event,data)=>{try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){}};
+  const log=(msg,level='info')=>send('log',{msg,level,ts:Date.now()});
+  const phase=(idx,state,sub)=>send('phase',{idx,state,sub});
+  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},15000);
+  try {
+    log(`╔═══ TEST CASE GENERATION STARTED ═══`);
+    log(`Project: ${projectName} · Prefix: ${prefix} · Epics: ${epics.join(', ')}`);
+    const client=new AtlassianClient({email:jira.jiraEmail,apiToken:jira.apiToken,siteUrl:jira.siteUrl});
+    phase(0,'active','');const me=await client.ping();log(`✓ Authenticated as ${me.displayName}`,'ok');phase(0,'done',`✓ ${me.displayName}`);
+    let fieldMap={};
+    try{fieldMap=await getFieldMap(client);log(`✓ Field mapping loaded`,'ok');}catch(e){log(`⚠ Field mapping unavailable`,'warn');}
+    phase(1,'active',`0 of ${epics.length}`);const epicsMeta=[];
+    for(let i=0;i<epics.length;i++){
+      const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);
+      const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority']),CONFIG.mcp.maxRetries,log);
+      const dt=adfToPlainText(epic.fields.description);
+      const roles=await extractEpicRoles(client,id,epic.fields,fieldMap);
+      epicsMeta.push({id,meta:{key:epic.key,title:epic.fields.summary,description:dt.slice(0,800),assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',engineeringManager:roles.engineeringManager,qaValidator:roles.qaValidator,stakeholders:roles.stakeholders}});
+      log(`✓ Epic loaded: ${epicsMeta[epicsMeta.length-1].meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);
+    }
+    phase(1,'done',`${epics.length} epics fetched`);phase(2,'active','');
+    const slbe={};let totalStories=0;
+    for(const em of epicsMeta){const jql=`parent in (${em.id}) AND issuetype = Story`;const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const issues=sr.issues||[];slbe[em.id]=issues;log(`✓ ${issues.length} stories for ${em.id}`,'ok');totalStories+=issues.length;}
+    phase(2,'done',`${totalStories} stories found`);if(totalStories===0)log(`⚠ No stories found.`,'warn');
+    phase(3,'active',`0 of ${totalStories}`);const allEpics=[];let done=0;
+    for(const em of epicsMeta){const list=slbe[em.id];const details=list.length>0?await fetchStoriesParallel(client,list,log):[];allEpics.push({id:em.id,meta:em.meta,stories:details});done+=list.length;phase(3,'active',`${done} of ${totalStories}`);}
+    phase(3,'done',`${totalStories} stories enriched`);
+    phase(4,'active','ready for generation');phase(4,'done','story data ready');
+    phase(5,'active','complete');phase(5,'done','complete');
+    log(`╚═══ JIRA FETCH COMPLETE — Generating test cases on client ═══`,'ok');
+    send('complete',{projectName,release,epics,prefix,allEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl});
+  }catch(err){console.error('[tc-gen]',err);try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}}
+  finally{clearInterval(hb);try{res.end();}catch(e){}}
+});
+
+app.post('/api/testcase/save', authMiddleware, async (req, res) => {
+  const {tcId,projectName,release,prefix,epics,cases,totals}=req.body||{};
+  if(!tcId||!projectName||!prefix||!Array.isArray(cases))return res.status(400).json({error:'tcId, projectName, prefix, cases[] required'});
+  try{
+    await saveTestCaseSet(tcId,req.user.email,projectName,release,prefix,epics||[],cases,totals||{});
+    await recordStatEvent(req.user.email,'testCases');
+    res.json({ok:true,tcId});
+  }catch(err){res.status(500).json({error:err.message});}
+});
+
+app.get('/api/testcase/list', authMiddleware, async (req, res) => {
+  const list=await getTestCasesList(req.user.email);res.json({testCases:list});
+});
+
+app.get('/api/testcase/:id', authMiddleware, async (req, res) => {
+  const tc=await getTestCaseSet(req.params.id,req.user.email);
+  if(!tc)return res.status(404).json({error:'Test case set not found'});
+  res.json(tc);
 });
 
 // SMTP TEST
