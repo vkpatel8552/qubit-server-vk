@@ -153,52 +153,46 @@ function getJiraToken(jiraData) {
 // ─── Verify saved connectors at login time ────────────────────────────────────
 // Returns a status object safe to send to the client.
 // NEVER returns decrypted tokens — only connection state.
+// Verify all saved connectors at login time.
+// Trusts stored tokens without a live ping — fast, no Jira/GitHub latency on login.
+// Live validation only happens via "Test Connection" button.
 async function _verifyAndUpdateConnectors(email) {
+  const ALL_CONNECTORS = ['jira', 'confluence', 'github', 'figma'];
   const status = {};
   try {
     const data = await getConnectors(email);
-    const jira = data.jira || {};
-
-    if (jira.connected && jira.apiTokenEnc) {
-      // Decrypt locally — never leaves server
-      const token = getDecryptedJiraToken(jira);
-      if (!token) {
-        // Encryption key may have rotated — mark as needing re-auth
-        status.jira = { connected: false, error: 'token_decrypt_failed', method: 'tok' };
-        // Update stored state to reflect failed status
-        data.jira = { ...jira, connected: false, lastCheckError: 'decrypt_failed', lastCheckedAt: new Date().toISOString() };
-        await saveConnectors(email, data);
-      } else {
-        // Live ping to Jira to verify the token is still valid
-        const client = new AtlassianClient({ email: jira.jiraEmail, apiToken: token, siteUrl: jira.siteUrl });
-        try {
-          const me = await client.ping();
-          // Token valid — refresh lastCheckedAt
-          data.jira = { ...jira, connected: true, lastCheckedAt: new Date().toISOString(), lastCheckError: null };
-          await saveConnectors(email, data);
-          status.jira = { connected: true, method: 'tok', jiraUser: me.displayName, siteUrl: jira.siteUrl };
-        } catch (pingErr) {
-          // Token invalid or expired
-          const errMsg = pingErr.message && pingErr.message.includes('401')
-            ? 'token_expired'
-            : pingErr.message && pingErr.message.includes('403')
-              ? 'token_permission_denied'
-              : 'connection_failed';
-          data.jira = { ...jira, connected: false, lastCheckError: errMsg, lastCheckedAt: new Date().toISOString() };
-          await saveConnectors(email, data);
-          status.jira = { connected: false, error: errMsg, method: 'tok', siteUrl: jira.siteUrl };
+    for (const id of ALL_CONNECTORS) {
+      const conn = data[id] || {};
+      if (conn.connected && (conn.apiTokenEnc || conn.apiToken)) {
+        // Token saved — decrypt and return connected without a live ping
+        const token = id === 'jira' ? getJiraToken(conn) : (conn.apiTokenEnc ? decryptToken(conn.apiTokenEnc) : conn.apiToken);
+        if (!token) {
+          // Decrypt failed — key rotation
+          status[id] = { connected: false, error: 'token_decrypt_failed', method: 'tok' };
+          data[id] = { ...conn, connected: false, lastCheckError: 'decrypt_failed', lastCheckedAt: new Date().toISOString() };
+        } else {
+          // Token present and decrypts OK — trust it
+          status[id] = {
+            connected:   true,
+            method:      'tok',
+            displayName: conn.displayName || null,
+            // Connector-specific fields
+            ...(id === 'jira' ? { siteUrl: conn.siteUrl, jiraEmail: conn.jiraEmail } : {}),
+            ...(id === 'confluence' ? { siteUrl: conn.siteUrl } : {})
+          };
         }
+      } else {
+        // Not connected
+        status[id] = { connected: false, method: null };
       }
-    } else if (jira.connected === false && jira.lastCheckError) {
-      // Previously failed — propagate the error so frontend can show it
-      status.jira = { connected: false, error: jira.lastCheckError, method: 'tok' };
-    } else {
-      // No connector saved yet
-      status.jira = { connected: false, method: null };
+    }
+    // Persist any decrypt-failure state changes
+    if (Object.values(status).some(s => s.error === 'token_decrypt_failed')) {
+      await saveConnectors(email, data);
     }
   } catch (e) {
     console.error('[connVerify]', e.message);
-    status.jira = { connected: false, error: 'server_error', method: null };
+    ALL_CONNECTORS.forEach(id => { status[id] = { connected: false, method: null }; });
   }
   return status;
 }
@@ -615,21 +609,10 @@ app.get('/api/stats/dashboard', authMiddleware, async (req, res) => {
 
 // CONNECTORS
 app.get('/api/connectors/status', authMiddleware, async (req, res) => {
-  const data=await getConnectors(req.user.email);const safe={};
-  Object.keys(data).forEach(k=>{
-    safe[k]={
-      connected:   data[k].connected,
-      method:      data[k].method,
-      connectedAt: data[k].connectedAt,
-      lastVerified:data[k].lastVerified,
-      siteUrl:     data[k].siteUrl,
-      displayName: data[k].displayName,
-      // Include disconnect reason if connection was lost — helps frontend show correct error
-      error: data[k].connected ? null : (data[k].disconnectReason || null)
-    };
-  });
-  // Never return raw or decrypted tokens — apiToken, apiTokenEnc are intentionally excluded
-  res.json({connectors:safe});
+  // Use _verifyAndUpdateConnectors to get consistent status for all connectors
+  const status = await _verifyAndUpdateConnectors(req.user.email).catch(() => ({}));
+  // Never return raw or decrypted tokens — only status fields
+  res.json({ connectors: status });
 });
 app.post('/api/connectors/jira/connect', authMiddleware, async (req, res) => {
   const {apiToken,email:jiraEmail,siteUrl}=req.body||{};if(!apiToken||!jiraEmail||!siteUrl)return res.status(400).json({error:'apiToken, email, siteUrl required'});
@@ -646,6 +629,65 @@ app.post('/api/connectors/jira/connect', authMiddleware, async (req, res) => {
     res.json({connected:true,method:'token',jiraUser:{accountId:me.accountId,displayName:me.displayName,email:me.emailAddress}});
   }
   catch(err){res.status(401).json({error:`Jira auth failed: ${err.message}`});}
+});
+
+// Generic connector connect: stores encrypted token for confluence, github, figma
+// Each connector validates differently — currently validates by token presence only.
+// Extend per-connector validation as needed.
+app.post('/api/connectors/:id/connect', authMiddleware, async (req, res) => {
+  const id = req.params.id;
+  if (id === 'jira') return res.status(400).json({ error: 'Use /api/connectors/jira/connect' });
+  const { apiToken } = req.body || {};
+  if (!apiToken) return res.status(400).json({ error: 'apiToken required' });
+
+  // Per-connector validation
+  let displayName = null;
+  try {
+    if (id === 'confluence') {
+      // Confluence shares Atlassian auth — reuse Jira token if available, or validate standalone
+      const existingData = await getConnectors(req.user.email);
+      const jira = existingData.jira || {};
+      const siteUrl = jira.siteUrl || 'clearlyrated.atlassian.net';
+      const jiraEmail = jira.jiraEmail || req.user.email;
+      // Quick ping: list spaces
+      const client = new AtlassianClient({ email: jiraEmail, apiToken, siteUrl });
+      const result = await client._req('GET', '/wiki/rest/api/space?limit=1').catch(() => null);
+      displayName = result ? 'Confluence workspace' : null;
+    } else if (id === 'figma') {
+      // Validate Figma token via /v1/me
+      const figmaRes = await fetch('https://api.figma.com/v1/me', {
+        headers: { 'X-Figma-Token': apiToken }
+      });
+      if (!figmaRes.ok) throw new Error(`Figma auth failed: ${figmaRes.status}`);
+      const figmaUser = await figmaRes.json();
+      displayName = figmaUser.handle || figmaUser.email || 'Figma user';
+    } else if (id === 'github') {
+      // Validate GitHub token via /user
+      const ghRes = await fetch('https://api.github.com/user', {
+        headers: { Authorization: `Bearer ${apiToken}`, 'User-Agent': 'Qubit-QA' }
+      });
+      if (!ghRes.ok) throw new Error(`GitHub auth failed: ${ghRes.status}`);
+      const ghUser = await ghRes.json();
+      displayName = ghUser.login || 'GitHub user';
+    } else {
+      // Unknown connector — store token without validation
+      displayName = id + ' user';
+    }
+  } catch (validationErr) {
+    return res.status(401).json({ error: `${id} auth failed: ${validationErr.message}` });
+  }
+
+  // Store encrypted
+  const data = await getConnectors(req.user.email);
+  data[id] = {
+    connected:    true,
+    method:       'token',
+    connectedAt:  new Date().toISOString(),
+    apiTokenEnc:  encryptToken(apiToken),
+    displayName:  displayName
+  };
+  await saveConnectors(req.user.email, data);
+  res.json({ connected: true, method: 'token', displayName });
 });
 app.post('/api/connectors/jira/test', authMiddleware, async (req, res) => {
   const data=await getConnectors(req.user.email);const jira=data.jira;if(!jira||!jira.connected)return res.status(400).json({error:'Jira not connected'});
