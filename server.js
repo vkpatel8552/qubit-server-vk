@@ -8,6 +8,45 @@
 const express    = require('express');
 const cors       = require('cors');
 const crypto     = require('crypto');
+
+// ─── Token Encryption (AES-256-GCM) ──────────────────────────────────────────
+// Key is derived from an env secret + a per-installation salt.
+// Never exposed outside server.js — frontend never sees cipher text.
+function _getEncKey() {
+  const secret = process.env.TOKEN_ENCRYPT_SECRET || process.env.JWT_SECRET || 'qubit-default-enc-secret-change-in-prod';
+  // Derive a 32-byte key using SHA-256 over the secret + fixed salt
+  return crypto.createHash('sha256').update(secret + ':qubit:connector:v1').digest();
+}
+
+function encryptToken(plaintext) {
+  if (!plaintext) return null;
+  const key = _getEncKey();
+  const iv  = crypto.randomBytes(12);          // 96-bit IV for GCM
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc  = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag  = cipher.getAuthTag();
+  // Store as: iv(hex):tag(hex):ciphertext(hex)
+  return iv.toString('hex') + ':' + tag.toString('hex') + ':' + enc.toString('hex');
+}
+
+function decryptToken(stored) {
+  if (!stored || !stored.includes(':')) return null;
+  try {
+    const parts = stored.split(':');
+    if (parts.length !== 3) return null;
+    const iv  = Buffer.from(parts[0], 'hex');
+    const tag = Buffer.from(parts[1], 'hex');
+    const enc = Buffer.from(parts[2], 'hex');
+    const key  = _getEncKey();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    return decipher.update(enc) + decipher.final('utf8');
+  } catch (e) {
+    console.warn('[enc] decryptToken failed:', e.message);
+    return null;
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 const path       = require('path');
 const https      = require('https');
 const nodemailer = require('nodemailer');
@@ -102,6 +141,68 @@ async function deleteUserSessions(email, exceptToken) {
   if (exceptToken) await db('DELETE FROM sessions WHERE email=$1 AND token!=$2', [email, exceptToken]);
   else await db('DELETE FROM sessions WHERE email=$1', [email]);
 }
+function getJiraToken(jiraData) {
+  if (!jiraData) return null;
+  // Support both old unencrypted (apiToken) and new encrypted (apiTokenEnc) storage
+  if (jiraData.apiTokenEnc) return decryptToken(jiraData.apiTokenEnc);
+  if (jiraData.apiToken)    return jiraData.apiToken;  // legacy plain-text fallback
+  return null;
+}
+
+
+// ─── Verify saved connectors at login time ────────────────────────────────────
+// Returns a status object safe to send to the client.
+// NEVER returns decrypted tokens — only connection state.
+async function _verifyAndUpdateConnectors(email) {
+  const status = {};
+  try {
+    const data = await getConnectors(email);
+    const jira = data.jira || {};
+
+    if (jira.connected && jira.apiTokenEnc) {
+      // Decrypt locally — never leaves server
+      const token = getDecryptedJiraToken(jira);
+      if (!token) {
+        // Encryption key may have rotated — mark as needing re-auth
+        status.jira = { connected: false, error: 'token_decrypt_failed', method: 'tok' };
+        // Update stored state to reflect failed status
+        data.jira = { ...jira, connected: false, lastCheckError: 'decrypt_failed', lastCheckedAt: new Date().toISOString() };
+        await saveConnectors(email, data);
+      } else {
+        // Live ping to Jira to verify the token is still valid
+        const client = new AtlassianClient({ email: jira.jiraEmail, apiToken: token, siteUrl: jira.siteUrl });
+        try {
+          const me = await client.ping();
+          // Token valid — refresh lastCheckedAt
+          data.jira = { ...jira, connected: true, lastCheckedAt: new Date().toISOString(), lastCheckError: null };
+          await saveConnectors(email, data);
+          status.jira = { connected: true, method: 'tok', jiraUser: me.displayName, siteUrl: jira.siteUrl };
+        } catch (pingErr) {
+          // Token invalid or expired
+          const errMsg = pingErr.message && pingErr.message.includes('401')
+            ? 'token_expired'
+            : pingErr.message && pingErr.message.includes('403')
+              ? 'token_permission_denied'
+              : 'connection_failed';
+          data.jira = { ...jira, connected: false, lastCheckError: errMsg, lastCheckedAt: new Date().toISOString() };
+          await saveConnectors(email, data);
+          status.jira = { connected: false, error: errMsg, method: 'tok', siteUrl: jira.siteUrl };
+        }
+      }
+    } else if (jira.connected === false && jira.lastCheckError) {
+      // Previously failed — propagate the error so frontend can show it
+      status.jira = { connected: false, error: jira.lastCheckError, method: 'tok' };
+    } else {
+      // No connector saved yet
+      status.jira = { connected: false, method: null };
+    }
+  } catch (e) {
+    console.error('[connVerify]', e.message);
+    status.jira = { connected: false, error: 'server_error', method: null };
+  }
+  return status;
+}
+
 async function getConnectors(email) {
   const r = await db('SELECT data FROM connectors WHERE email=$1', [email.toLowerCase()]);
   return r.rows[0] ? r.rows[0].data : {};
@@ -420,7 +521,12 @@ app.post('/api/auth/login', async (req, res) => {
   const user=await getUser(emailLower);
   if(!user||user.passwordHash!==hashPassword(password,emailLower))return res.status(401).json({error:'Invalid credentials'});
   const token=createToken();await createSession(token,emailLower);
-  const {passwordHash,...pub}=user;res.json({user:pub,token});
+  const {passwordHash,...pub}=user;
+
+  // ── Auto-verify saved connectors (server-side only — tokens never sent to client) ──
+  const connStatus = await _verifyAndUpdateConnectors(emailLower);
+
+  res.json({user:pub, token, connectors: connStatus});
 });
 
 // GOOGLE SSO
@@ -432,7 +538,9 @@ app.post('/api/auth/google', async (req, res) => {
   let user=await getUser(email);
   if(!user){const fn=payload.given_name||email.split('@')[0],ln=payload.family_name||'';const ini=((fn[0]||'')+(ln[0]||'')).toUpperCase()||'?';user={firstName:fn,lastName:ln,fullName:payload.name||fn,email,phone:'',org:email.split('@')[1],role:'Other',bio:'',initials:ini,avatar:payload.picture?{type:'photo',data:payload.picture}:{type:'initials'},passwordHash:'',googleSub:payload.sub,createdAt:new Date().toISOString()};await saveUser(user);}
   const token=createToken();await createSession(token,email);
-  const {passwordHash,...pub}=user;res.json({user:pub,token});
+  const {passwordHash,...pub}=user;
+  const connStatus = await _verifyAndUpdateConnectors(email);
+  res.json({user:pub, token, connectors: connStatus});
 });
 
 // SELF-SERVICE REGISTER REQUEST
@@ -456,7 +564,11 @@ app.get('/api/auth/register-token/:token', async (req, res) => {
 
 // LOGOUT / ME / PROFILE / PASSWORD
 app.post('/api/auth/logout', authMiddleware, async (req, res) => { await deleteSession(req.token); res.json({ok:true}); });
-app.get('/api/auth/me', authMiddleware, (req, res) => { const {passwordHash,...pub}=req.user; res.json({user:pub}); });
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  const connStatus = await _verifyAndUpdateConnectors(req.user.email).catch(() => ({}));
+  const {passwordHash,...pub}=req.user;
+  res.json({user:pub, connectors:connStatus});
+});
 app.put('/api/auth/profile', authMiddleware, async (req, res) => {
   const {firstName,lastName,org,role,phone,bio,avatar}=req.body||{};const user={...req.user};
   if(firstName)user.firstName=firstName;if(lastName)user.lastName=lastName;
@@ -504,19 +616,41 @@ app.get('/api/stats/dashboard', authMiddleware, async (req, res) => {
 // CONNECTORS
 app.get('/api/connectors/status', authMiddleware, async (req, res) => {
   const data=await getConnectors(req.user.email);const safe={};
-  Object.keys(data).forEach(k=>{safe[k]={connected:data[k].connected,method:data[k].method,connectedAt:data[k].connectedAt};});
+  Object.keys(data).forEach(k=>{
+    safe[k]={
+      connected:   data[k].connected,
+      method:      data[k].method,
+      connectedAt: data[k].connectedAt,
+      lastVerified:data[k].lastVerified,
+      siteUrl:     data[k].siteUrl,
+      displayName: data[k].displayName,
+      // Include disconnect reason if connection was lost — helps frontend show correct error
+      error: data[k].connected ? null : (data[k].disconnectReason || null)
+    };
+  });
+  // Never return raw or decrypted tokens — apiToken, apiTokenEnc are intentionally excluded
   res.json({connectors:safe});
 });
 app.post('/api/connectors/jira/connect', authMiddleware, async (req, res) => {
   const {apiToken,email:jiraEmail,siteUrl}=req.body||{};if(!apiToken||!jiraEmail||!siteUrl)return res.status(400).json({error:'apiToken, email, siteUrl required'});
   const ns=siteUrl.replace(/^https?:\/\//,'').replace(/\/$/,'');const client=new AtlassianClient({email:jiraEmail,apiToken,siteUrl:ns});
-  try{const me=await client.ping();const data=await getConnectors(req.user.email);data.jira={connected:true,method:'token',connectedAt:new Date().toISOString(),apiToken,jiraEmail,siteUrl:ns,accountId:me.accountId,displayName:me.displayName};await saveConnectors(req.user.email,data);res.json({connected:true,method:'token',jiraUser:{accountId:me.accountId,displayName:me.displayName,email:me.emailAddress}});}
+  try{const me=await client.ping();const data=await getConnectors(req.user.email);
+    data.jira={
+      connected:true, method:'token',
+      connectedAt:new Date().toISOString(),
+      apiTokenEnc:encryptToken(apiToken),  // stored encrypted — never plain text
+      jiraEmail, siteUrl:ns,
+      accountId:me.accountId, displayName:me.displayName
+    };
+    await saveConnectors(req.user.email,data);
+    res.json({connected:true,method:'token',jiraUser:{accountId:me.accountId,displayName:me.displayName,email:me.emailAddress}});
+  }
   catch(err){res.status(401).json({error:`Jira auth failed: ${err.message}`});}
 });
 app.post('/api/connectors/jira/test', authMiddleware, async (req, res) => {
   const data=await getConnectors(req.user.email);const jira=data.jira;if(!jira||!jira.connected)return res.status(400).json({error:'Jira not connected'});
   const steps=[],logStep=(ok,msg)=>steps.push({ok,msg,ts:Date.now()});
-  try{const t0=Date.now();logStep(true,`Pinging ${jira.siteUrl}`);const client=new AtlassianClient({email:jira.jiraEmail,apiToken:jira.apiToken,siteUrl:jira.siteUrl});const me=await client.ping();logStep(true,`Authenticated as ${me.displayName}`);const p=await client.searchByJql('issuetype = Epic ORDER BY created DESC',['summary'],1);logStep(true,`Probe JQL returned ${p.issues.length} result(s)`);logStep(true,`Latency: ${Date.now()-t0}ms`);res.json({ok:true,steps,latency:Date.now()-t0,jiraUser:me.displayName});}
+  try{const t0=Date.now();logStep(true,`Pinging ${jira.siteUrl}`);const client=new AtlassianClient({email:jira.jiraEmail,apiToken:getJiraToken(jira),siteUrl:jira.siteUrl});const me=await client.ping();logStep(true,`Authenticated as ${me.displayName}`);const p=await client.searchByJql('issuetype = Epic ORDER BY created DESC',['summary'],1);logStep(true,`Probe JQL returned ${p.issues.length} result(s)`);logStep(true,`Latency: ${Date.now()-t0}ms`);res.json({ok:true,steps,latency:Date.now()-t0,jiraUser:me.displayName});}
   catch(err){logStep(false,err.message);res.status(500).json({ok:false,steps,error:err.message});}
 });
 app.delete('/api/connectors/:id', authMiddleware, async (req, res) => {
@@ -537,7 +671,7 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
   try {
     log(`╔═══ TEST PLAN GENERATION STARTED ═══`);
     log(`Project: ${projectName} · Epics: ${epics.join(', ')}`);
-    const client=new AtlassianClient({email:jira.jiraEmail,apiToken:jira.apiToken,siteUrl:jira.siteUrl});
+    const client=new AtlassianClient({email:jira.jiraEmail,apiToken:getJiraToken(jira),siteUrl:jira.siteUrl});
     phase(0,'active','');const me=await client.ping();log(`✓ Authenticated as ${me.displayName}`,'ok');phase(0,'done',`✓ ${me.displayName}`);
 
     // Fetch Jira field mapping once (used for EM and QA detection)
@@ -626,7 +760,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   try {
     log(`╔═══ TEST CASE GENERATION STARTED ═══`);
     log(`Project: ${projectName} · Prefix: ${prefix} · Epics: ${epics.join(', ')}`);
-    const client=new AtlassianClient({email:jira.jiraEmail,apiToken:jira.apiToken,siteUrl:jira.siteUrl});
+    const client=new AtlassianClient({email:jira.jiraEmail,apiToken:getJiraToken(jira),siteUrl:jira.siteUrl});
     phase(0,'active','');const me=await client.ping();log(`✓ Authenticated as ${me.displayName}`,'ok');phase(0,'done',`✓ ${me.displayName}`);
     let fieldMap={};
     try{fieldMap=await getFieldMap(client);log(`✓ Field mapping loaded`,'ok');}catch(e){log(`⚠ Field mapping unavailable`,'warn');}
@@ -687,6 +821,42 @@ app.get('/api/testcase/:id', authMiddleware, async (req, res) => {
   const tc=await getTestCaseSet(req.params.id,req.user.email);
   if(!tc)return res.status(404).json({error:'Test case set not found'});
   res.json(tc);
+});
+
+
+// AUTO-VERIFY — called after login to silently validate stored credentials
+app.get('/api/connectors/verify', authMiddleware, async (req, res) => {
+  const data  = await getConnectors(req.user.email);
+  const jira  = data.jira;
+  const result = { jiraConnected: false, jiraError: null };
+
+  if (jira && jira.connected) {
+    const token = getJiraToken(jira);
+    if (!token) {
+      result.jiraError = 'Jira API token is missing or could not be decrypted. Please re-enter your token.';
+    } else {
+      try {
+        const client = new AtlassianClient({ email: jira.jiraEmail, apiToken: token, siteUrl: jira.siteUrl });
+        await client.ping();
+        result.jiraConnected = true;
+      } catch (e) {
+        const msg = e.message || '';
+        if (/401|403|unauthorized|forbidden/i.test(msg)) {
+          result.jiraError = 'Jira API token has expired or been revoked. Please reconnect with a new token.';
+        } else if (/ENOTFOUND|ECONNREFUSED|network|timeout/i.test(msg)) {
+          result.jiraError = 'Cannot reach Jira. Check your network connection and try again.';
+        } else {
+          result.jiraError = 'Jira connection could not be verified: ' + msg;
+        }
+        // Mark as disconnected in DB so user must reconnect
+        jira.connected = false;
+        jira.lastError  = result.jiraError;
+        await saveConnectors(req.user.email, data);
+      }
+    }
+  }
+
+  res.json(result);
 });
 
 // SMTP TEST
