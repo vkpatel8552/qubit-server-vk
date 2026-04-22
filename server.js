@@ -859,8 +859,8 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     }));
     phase(5,'done','Ready');
 
-    // Fetch existing test plan for these epics (if any) — gives scenario headings + bullet items
-    // that the AI uses as a blueprint when writing test cases
+    // Phase 6: Fetch existing test plan scenarios for these epics
+    phase(5,'active','Fetching test plan scenarios from database...');
     let existingPlanScenarios = null;
     try {
       const epicIds = enrichedEpics.map(e => e.id);
@@ -870,23 +870,33 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       );
       if (planRow.rows[0] && planRow.rows[0].summary) {
         const planSum = planRow.rows[0].summary;
-        // Extract scenario headings + bullet items per story from the saved plan
-        existingPlanScenarios = (planSum.epics || []).flatMap(e =>
-          (e.stories || []).map(s => ({
-            storyKey:  s.storyKey,
+        const planEpics = planSum.epics || [];
+        const storyCount = planEpics.reduce((a, e) => a + (e.stories||[]).length, 0);
+        log(`✓ Found test plan "${planSum.project || 'unnamed'}" — ${planEpics.length} epic(s), ${storyCount} story(s)`, 'ok');
+        // Log every story title so user can see what scenarios will drive TC generation
+        planEpics.forEach(function(e) {
+          log(`  Epic ${e.epicKey}: ${e.epicTitle}`, 'ok');
+          (e.stories||[]).forEach(function(s) {
+            log(`    • Story ${s.storyKey}: ${s.storyTitle}`, 'ok');
+          });
+        });
+        existingPlanScenarios = planEpics.flatMap(e =>
+          (e.stories||[]).map(s => ({
+            storyKey:   s.storyKey,
             storyTitle: s.storyTitle,
-            ac:        s.acceptanceCriteria || []
-            // Note: genScenarios runs client-side — we send the raw story data
-            // and let the AI prompt instruct Claude to use test-plan-style grouping
+            ac:         s.acceptanceCriteria || []
           }))
         );
-        log(`✓ Found existing test plan — scenarios will guide test case design`, 'ok');
+        log(`✓ ${existingPlanScenarios.length} stories from test plan will guide test case generation`, 'ok');
+      } else {
+        log(`⚠ No existing test plan found for these epics — scenarios will be derived from Jira ACs`, 'warn');
       }
     } catch(planErr) {
-      log(`⚠ Could not fetch existing test plan — proceeding with Jira data only`, 'warn');
+      log(`⚠ Could not fetch test plan: ${planErr.message} — proceeding with Jira data`, 'warn');
     }
+    phase(5,'done','Test plan scenarios loaded');
 
-    log(`╚═══ JIRA + CONFLUENCE FETCH COMPLETE — Building test cases on client ═══`,'ok');
+    log(`╚═══ ALL DATA READY — Sending to client for AI test case generation ═══`,'ok');
     send('complete',{projectName,release,epics,prefix,allEpics:enrichedEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl,confluenceByEpic,existingPlanScenarios});
   }catch(err){console.error('[tc-gen]',err);try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}}
   finally{clearInterval(hb);try{res.end();}catch(e){}}
