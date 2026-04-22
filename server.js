@@ -1,40 +1,37 @@
 /**
- * qubit-server — Backend proxy for the Qubit QA platform
- * Email: Mailgun SMTP via nodemailer (smtp.mailgun.org, username + password)
+ * qubit-server v1.3.0
+ * PostgreSQL-backed: users, sessions, connectors, test plans, stats
+ * Email: Mailgun SMTP via nodemailer
  */
-
 'use strict';
 
 const express    = require('express');
 const cors       = require('cors');
 const crypto     = require('crypto');
-const fs         = require('fs').promises;
-const fsSync     = require('fs');
 const path       = require('path');
 const https      = require('https');
 const nodemailer = require('nodemailer');
+const { Pool }   = require('pg');
 
 require('dotenv').config();
 
 const CONFIG = {
-  port:           process.env.PORT     || 4000,
-  dataDir:        process.env.DATA_DIR || path.join(__dirname, 'data'),
-  tempDir:        process.env.TEMP_DIR || path.join(__dirname, 'tmp'),
-  jwtSecret:      process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
-  allowedDomains: (process.env.ALLOWED_DOMAINS || 'clearlyrated.com,thoughtminds.io').split(','),
-  corsOrigin:     process.env.CORS_ORIGIN || '*',
-  googleClientId: process.env.GOOGLE_CLIENT_ID || '',
-  frontendUrl:    (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, ''),
-  // Mailgun SMTP — set these 4 vars in Render environment
+  port:             process.env.PORT || 4000,
+  jwtSecret:        process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
+  allowedDomains:   (process.env.ALLOWED_DOMAINS || 'clearlyrated.com,thoughtminds.io').split(','),
+  corsOrigin:       process.env.CORS_ORIGIN || '*',
+  googleClientId:   process.env.GOOGLE_CLIENT_ID || '',
+  frontendUrl:      (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, ''),
   smtp: {
     host: 'smtp.mailgun.org',
     port: 587,
-    user: process.env.SMTP_USER || '',   // Mailgun SMTP login   e.g. qa@crmail.clearlyrated.com
-    pass: process.env.SMTP_PASS || '',   // Mailgun SMTP password
+    user: process.env.SMTP_USER || '',
+    pass: process.env.SMTP_PASS || '',
     from: process.env.SMTP_FROM || 'Qubit QA Platform <noreply@qubit.io>',
   },
   inviteExpiryMs:   7 * 24 * 60 * 60 * 1000,
   regTokenExpiryMs: 24 * 60 * 60 * 1000,
+  sessionExpiryMs:  7 * 24 * 60 * 60 * 1000,
   mcp: {
     timeout:         parseInt(process.env.MCP_TIMEOUT_MS       || '300000', 10),
     maxRetries:      parseInt(process.env.MCP_MAX_RETRIES      || '5',      10),
@@ -42,1039 +39,431 @@ const CONFIG = {
   }
 };
 
-[CONFIG.dataDir, CONFIG.tempDir].forEach(d => {
-  if (!fsSync.existsSync(d)) fsSync.mkdirSync(d, { recursive: true });
+// PostgreSQL Pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
-const DB = {
-  usersFile:      path.join(CONFIG.dataDir, 'users.json'),
-  sessionsFile:   path.join(CONFIG.dataDir, 'sessions.json'),
-  connectorsFile: path.join(CONFIG.dataDir, 'connectors.json'),
-  planIndexFile:  path.join(CONFIG.dataDir, 'plan-index.json'),
-  statsFile:      path.join(CONFIG.dataDir, 'stats.json'),
-  invitesFile:    path.join(CONFIG.dataDir, 'invites.json')
-};
-
-async function readJson(file, fallback = {}) {
-  try { return JSON.parse(await fs.readFile(file, 'utf8')); } catch { return fallback; }
-}
-async function writeJson(file, data) {
-  const tmp = file + '.tmp';
-  await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
-  await fs.rename(tmp, file);
+async function db(sql, params = []) {
+  const client = await pool.connect();
+  try { return await client.query(sql, params); }
+  finally { client.release(); }
 }
 
-// ─── Mailgun SMTP transporter ─────────────────────────────────────────────────
+async function initDB() {
+  await db(`CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, data JSONB NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())`);
+  await db(`CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, email TEXT NOT NULL REFERENCES users(email) ON DELETE CASCADE, created_at BIGINT NOT NULL)`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email)`);
+  await db(`CREATE TABLE IF NOT EXISTS connectors (email TEXT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}')`);
+  await db(`CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY, email TEXT NOT NULL, invited_by TEXT, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL)`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email)`);
+  await db(`CREATE TABLE IF NOT EXISTS test_plans (plan_id TEXT PRIMARY KEY, email TEXT NOT NULL, project TEXT NOT NULL, release TEXT, epics JSONB NOT NULL DEFAULT '[]', summary JSONB, generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_test_plans_email ON test_plans(email)`);
+  await db(`CREATE TABLE IF NOT EXISTS stat_events (id SERIAL PRIMARY KEY, email TEXT NOT NULL, stat_type TEXT NOT NULL, recorded_date DATE NOT NULL DEFAULT CURRENT_DATE, created_at TIMESTAMPTZ DEFAULT NOW())`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_stat_events_email ON stat_events(email)`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_stat_events_date  ON stat_events(recorded_date)`);
+  console.log('[db] Tables ready');
+}
+
+// DB helpers
+async function getUser(email) {
+  const r = await db('SELECT data FROM users WHERE email=$1', [email.toLowerCase()]);
+  return r.rows[0] ? r.rows[0].data : null;
+}
+async function saveUser(user) {
+  await db(`INSERT INTO users(email,data) VALUES($1,$2) ON CONFLICT(email) DO UPDATE SET data=EXCLUDED.data`, [user.email.toLowerCase(), JSON.stringify(user)]);
+}
+async function getSession(token) {
+  const r = await db('SELECT email,created_at FROM sessions WHERE token=$1', [token]);
+  if (!r.rows[0]) return null;
+  return { email: r.rows[0].email, createdAt: Number(r.rows[0].created_at) };
+}
+async function createSession(token, email) {
+  await db('INSERT INTO sessions(token,email,created_at) VALUES($1,$2,$3)', [token, email.toLowerCase(), Date.now()]);
+}
+async function deleteSession(token) { await db('DELETE FROM sessions WHERE token=$1', [token]); }
+async function deleteUserSessions(email, exceptToken) {
+  if (exceptToken) await db('DELETE FROM sessions WHERE email=$1 AND token!=$2', [email, exceptToken]);
+  else await db('DELETE FROM sessions WHERE email=$1', [email]);
+}
+async function getConnectors(email) {
+  const r = await db('SELECT data FROM connectors WHERE email=$1', [email.toLowerCase()]);
+  return r.rows[0] ? r.rows[0].data : {};
+}
+async function saveConnectors(email, data) {
+  await db(`INSERT INTO connectors(email,data) VALUES($1,$2) ON CONFLICT(email) DO UPDATE SET data=EXCLUDED.data`, [email.toLowerCase(), JSON.stringify(data)]);
+}
+async function getInvite(token) {
+  const r = await db('SELECT * FROM invites WHERE token=$1', [token]);
+  if (!r.rows[0]) return null;
+  return { email: r.rows[0].email, invitedBy: r.rows[0].invited_by, createdAt: Number(r.rows[0].created_at), expiresAt: Number(r.rows[0].expires_at) };
+}
+async function saveInvite(token, email, invitedBy, expiresAt) {
+  await db('INSERT INTO invites(token,email,invited_by,created_at,expires_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(token) DO NOTHING', [token, email.toLowerCase(), invitedBy || null, Date.now(), expiresAt]);
+}
+async function deleteInvite(token) { await db('DELETE FROM invites WHERE token=$1', [token]); }
+async function findUnexpiredInvite(email) {
+  const r = await db('SELECT token,expires_at FROM invites WHERE email=$1 AND expires_at > $2 LIMIT 1', [email.toLowerCase(), Date.now()]);
+  return r.rows[0] ? { token: r.rows[0].token, expiresAt: Number(r.rows[0].expires_at) } : null;
+}
+async function savePlan(planId, email, project, release, epics, summary) {
+  await db(`INSERT INTO test_plans(plan_id,email,project,release,epics,summary,generated_at) VALUES($1,$2,$3,$4,$5,$6,NOW())`,
+    [planId, email.toLowerCase(), project, release || 'Unscheduled', JSON.stringify(epics), JSON.stringify(summary)]);
+}
+async function getPlans(email) {
+  const r = await db(`SELECT plan_id,project,release,epics,generated_at, (summary->'totals') AS totals FROM test_plans WHERE email=$1 ORDER BY generated_at DESC`, [email.toLowerCase()]);
+  return r.rows.map(row => ({ planId: row.plan_id, project: row.project, release: row.release, epics: row.epics, generatedAt: row.generated_at, totals: row.totals }));
+}
+async function getPlanSummary(planId, email) {
+  const r = await db('SELECT summary FROM test_plans WHERE plan_id=$1 AND email=$2', [planId, email.toLowerCase()]);
+  return r.rows[0] ? r.rows[0].summary : null;
+}
+async function recordStatEvent(email, statType) {
+  await db('INSERT INTO stat_events(email,stat_type) VALUES($1,$2)', [email.toLowerCase(), statType]);
+}
+async function getStatsForRange(range) {
+  const rangeMap = { week: '7 days', month: '1 month', quarter: '3 months', year: '1 year' };
+  const interval = rangeMap[range] || '1 month';
+  const r = await db(`SELECT email, stat_type, COUNT(*)::int AS cnt, recorded_date::text FROM stat_events WHERE created_at >= NOW() - INTERVAL '${interval}' GROUP BY email, stat_type, recorded_date ORDER BY recorded_date`, []);
+  return r.rows;
+}
+async function getUserCount() {
+  const r = await db('SELECT COUNT(*)::int AS cnt FROM users', []);
+  return r.rows[0].cnt;
+}
+
+function buildChartData(rows, range) {
+  const now = new Date();
+  let periods = [];
+  if (range === 'week') {
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now); d.setDate(d.getDate() - i);
+      periods.push({ key: d.toISOString().slice(0,10), label: d.toLocaleString('default', { weekday:'short' }) });
+    }
+  } else {
+    const count = range === 'quarter' ? 12 : range === 'year' ? 12 : 6;
+    for (let i = count - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+      periods.push({ key, label: d.toLocaleString('default', { month:'short', year:'2-digit' }) });
+    }
+  }
+  const bk = { testPlans:{}, testCases:{}, autoScripts:{} };
+  periods.forEach(p => { bk.testPlans[p.key]=0; bk.testCases[p.key]=0; bk.autoScripts[p.key]=0; });
+  rows.forEach(row => {
+    const dateKey = range === 'week' ? row.recorded_date : row.recorded_date.slice(0,7);
+    if (bk[row.stat_type] && bk[row.stat_type][dateKey] !== undefined) bk[row.stat_type][dateKey] += row.cnt;
+  });
+  return { labels: periods.map(p => p.label), testPlans: periods.map(p => bk.testPlans[p.key]), testCases: periods.map(p => bk.testCases[p.key]), autoScripts: periods.map(p => bk.autoScripts[p.key]) };
+}
+
+// Mailgun SMTP
 function createTransporter() {
   const { host, port, user, pass } = CONFIG.smtp;
-  if (!user || !pass) {
-    throw new Error(
-      'SMTP not configured. Set SMTP_USER and SMTP_PASS in Render environment variables.'
-    );
-  }
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure: false,             // STARTTLS on port 587
-    auth: { user, pass },
-    tls:  { rejectUnauthorized: false },
-  });
+  if (!user || !pass) throw new Error('SMTP not configured. Set SMTP_USER and SMTP_PASS.');
+  return nodemailer.createTransport({ host, port, secure:false, auth:{user,pass}, tls:{rejectUnauthorized:false} });
 }
-
-// ─── Registration email template ─────────────────────────────────────────────
-function buildRegistrationEmail(toEmail, registrationUrl) {
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Complete your Qubit registration</title></head>
-<body style="margin:0;padding:0;background:#f2f3fb;font-family:'Segoe UI',Arial,sans-serif;-webkit-font-smoothing:antialiased">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#f2f3fb;padding:40px 16px">
-  <tr><td align="center">
-    <table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.10)">
-
-      <!-- Header -->
-      <tr><td style="background:linear-gradient(135deg,#7c3aed 0%,#a855f7 55%,#ec4899 100%);padding:36px 40px 28px;text-align:center">
-        <table cellpadding="0" cellspacing="0" style="margin:0 auto 18px">
-          <tr><td style="width:56px;height:56px;background:rgba(255,255,255,.18);border-radius:14px;text-align:center;vertical-align:middle;font-size:28px">&#128737;</td></tr>
-        </table>
-        <h1 style="color:#ffffff;font-size:24px;font-weight:800;margin:0 0 6px;letter-spacing:-.3px">Qubit QA Platform</h1>
-        <p style="color:rgba(255,255,255,.85);font-size:14px;margin:0;font-weight:500">Intelligent Test Planning</p>
-      </td></tr>
-
-      <!-- Body -->
-      <tr><td style="padding:40px 40px 32px">
-        <h2 style="color:#0f1017;font-size:20px;font-weight:800;margin:0 0 10px;letter-spacing:-.2px">Complete your registration</h2>
-        <p style="color:#5c6278;font-size:14.5px;line-height:1.65;margin:0 0 28px">
-          Hi there,<br><br>
-          You requested to create a <strong style="color:#0f1017">Qubit QA Platform</strong> account for
-          <strong style="color:#7c3aed">${toEmail}</strong>.
-          Click the button below to complete your setup &mdash; it only takes a minute.
-        </p>
-
-        <!-- CTA Button -->
-        <table cellpadding="0" cellspacing="0" width="100%">
-          <tr><td align="center" style="padding:4px 0 32px">
-            <a href="${registrationUrl}"
-               style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#ffffff;text-decoration:none;font-size:15px;font-weight:700;padding:15px 40px;border-radius:10px;box-shadow:0 4px 18px rgba(124,58,237,.35);letter-spacing:.1px">
-              Complete Registration &rarr;
-            </a>
-          </td></tr>
-        </table>
-
-        <!-- Info box -->
-        <table cellpadding="0" cellspacing="0" width="100%" style="background:#f8f7ff;border:1px solid rgba(124,58,237,.14);border-radius:10px">
-          <tr><td style="padding:18px 22px">
-            <p style="font-size:13px;color:#5c6278;margin:0 0 8px"><strong style="color:#7c3aed">&#9200; Expires in:</strong>&nbsp; 24 hours</p>
-            <p style="font-size:13px;color:#5c6278;margin:0 0 8px"><strong style="color:#7c3aed">&#128231; For email:</strong>&nbsp; ${toEmail}</p>
-            <p style="font-size:13px;color:#5c6278;margin:0"><strong style="color:#7c3aed">&#128274; One-time use:</strong>&nbsp; Link is invalidated after registration</p>
-          </td></tr>
-        </table>
-
-        <p style="color:#9498b0;font-size:12.5px;line-height:1.65;margin:24px 0 0">
-          Didn&apos;t request this? You can safely ignore this email &mdash; no account will be created without completing registration.
-        </p>
-        <p style="color:#9498b0;font-size:12px;line-height:1.65;margin:12px 0 0;word-break:break-all">
-          Button not working? Paste this link into your browser:<br>
-          <a href="${registrationUrl}" style="color:#7c3aed">${registrationUrl}</a>
-        </p>
-      </td></tr>
-
-      <!-- Footer -->
-      <tr><td style="background:#f8f7ff;border-top:1px solid #ebe9f8;padding:20px 40px;text-align:center">
-        <p style="color:#9498b0;font-size:12px;margin:0 0 4px;font-weight:600">Qubit QA Platform</p>
-        <p style="color:#b8bcd0;font-size:11.5px;margin:0">This is an automated message &mdash; please do not reply.</p>
-      </td></tr>
-
-    </table>
-    <p style="color:#b8bcd0;font-size:11px;text-align:center;margin:16px 0 0">&copy; ${new Date().getFullYear()} Qubit QA Platform. All rights reserved.</p>
-  </td></tr>
-</table>
-</body>
-</html>`;
-
-  const text = [
-    'Complete your Qubit QA Platform registration',
-    '',
-    'Hi,',
-    '',
-    `You requested to create a Qubit account for ${toEmail}.`,
-    'Click the link below to complete registration (expires in 24 hours):',
-    '',
-    registrationUrl,
-    '',
-    "If you didn't request this, you can safely ignore this email.",
-    '',
-    '— Qubit QA Platform',
-  ].join('\n');
-
+function buildRegistrationEmail(toEmail, url) {
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f2f3fb;font-family:'Segoe UI',Arial,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f2f3fb;padding:40px 16px"><tr><td align="center"><table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.1)"><tr><td style="background:linear-gradient(135deg,#7c3aed,#ec4899);padding:36px 40px 28px;text-align:center"><h1 style="color:#fff;font-size:24px;font-weight:800;margin:0 0 6px">Qubit QA Platform</h1><p style="color:rgba(255,255,255,.85);font-size:14px;margin:0">Intelligent Test Planning</p></td></tr><tr><td style="padding:40px 40px 32px"><h2 style="color:#0f1017;font-size:20px;font-weight:800;margin:0 0 10px">Complete your registration</h2><p style="color:#5c6278;font-size:14.5px;line-height:1.65;margin:0 0 28px">You requested to create a <strong>Qubit QA Platform</strong> account for <strong style="color:#7c3aed">${toEmail}</strong>.</p><table cellpadding="0" cellspacing="0" width="100%"><tr><td align="center" style="padding:4px 0 32px"><a href="${url}" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;text-decoration:none;font-size:15px;font-weight:700;padding:15px 40px;border-radius:10px">Complete Registration &rarr;</a></td></tr></table><table cellpadding="0" cellspacing="0" width="100%" style="background:#f8f7ff;border:1px solid rgba(124,58,237,.14);border-radius:10px"><tr><td style="padding:18px 22px"><p style="font-size:13px;color:#5c6278;margin:0 0 8px"><strong style="color:#7c3aed">&#9200; Expires in:</strong>&nbsp;24 hours</p><p style="font-size:13px;color:#5c6278;margin:0"><strong style="color:#7c3aed">&#128274; One-time use:</strong>&nbsp;Link invalidates after registration</p></td></tr></table><p style="color:#9498b0;font-size:12px;margin:24px 0 0;word-break:break-all">Button not working? <a href="${url}" style="color:#7c3aed">${url}</a></p></td></tr><tr><td style="background:#f8f7ff;border-top:1px solid #ebe9f8;padding:20px 40px;text-align:center"><p style="color:#9498b0;font-size:12px;margin:0">Automated message — please do not reply.</p></td></tr></table></td></tr></table></body></html>`;
+  const text = `Complete your Qubit registration\n\nAccount for: ${toEmail}\nLink (expires 24h): ${url}\n\n— Qubit QA Platform`;
   return { html, text };
 }
-
-async function sendRegistrationEmail(toEmail, registrationUrl) {
+async function sendRegistrationEmail(toEmail, url) {
   const transporter = createTransporter();
-  const { html, text } = buildRegistrationEmail(toEmail, registrationUrl);
-  const info = await transporter.sendMail({
-    from:    CONFIG.smtp.from,
-    to:      toEmail,
-    subject: 'Complete your Qubit registration',
-    text,
-    html,
-  });
-  console.log(`[smtp] Registration email sent → ${toEmail} (messageId: ${info.messageId})`);
+  const { html, text } = buildRegistrationEmail(toEmail, url);
+  const info = await transporter.sendMail({ from: CONFIG.smtp.from, to: toEmail, subject: 'Complete your Qubit registration', text, html });
+  console.log(`[smtp] Sent → ${toEmail} (${info.messageId})`);
   return info;
 }
 
-
-
-function hashPassword(pwd, email) {
-  return crypto.createHash('sha256').update(pwd + '|qubit-server|' + email.toLowerCase()).digest('hex');
-}
+// Auth helpers
+function hashPassword(pwd, email) { return crypto.createHash('sha256').update(pwd+'|qubit-server|'+email.toLowerCase()).digest('hex'); }
 function createToken() { return crypto.randomBytes(32).toString('hex'); }
-function domainOk(email) {
-  const d = (email || '').split('@')[1];
-  return CONFIG.allowedDomains.includes((d || '').toLowerCase());
-}
-function passwordValid(p) {
-  return p.length >= 8 && /[A-Z]/.test(p) && /[a-z]/.test(p) && /[0-9]/.test(p) && /[^A-Za-z0-9]/.test(p);
-}
+function domainOk(email) { const d=(email||'').split('@')[1]; return CONFIG.allowedDomains.includes((d||'').toLowerCase()); }
+function passwordValid(p) { return p.length>=8&&/[A-Z]/.test(p)&&/[a-z]/.test(p)&&/[0-9]/.test(p)&&/[^A-Za-z0-9]/.test(p); }
 
 async function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'No token' });
-  const sessions = await readJson(DB.sessionsFile);
-  const session = sessions[token];
+  const session = await getSession(token);
   if (!session) return res.status(401).json({ error: 'Invalid token' });
-  if (Date.now() - session.createdAt > 7 * 24 * 60 * 60 * 1000) {
-    delete sessions[token];
-    await writeJson(DB.sessionsFile, sessions);
-    return res.status(401).json({ error: 'Session expired' });
-  }
-  const users = await readJson(DB.usersFile);
-  const user = users[session.email];
+  if (Date.now() - session.createdAt > CONFIG.sessionExpiryMs) { await deleteSession(token); return res.status(401).json({ error: 'Session expired' }); }
+  const user = await getUser(session.email);
   if (!user) return res.status(401).json({ error: 'User not found' });
-  req.user = user;
-  req.token = token;
-  req.session = session;
+  req.user = user; req.token = token; req.session = session;
   next();
 }
 
-// ─── Stats helpers ──────────────────────────────────────────────────────────
-async function recordStat(email, type) {
-  const stats = await readJson(DB.statsFile, { global: {}, byUser: {} });
-  if (!stats.global) stats.global = {};
-  if (!stats.byUser) stats.byUser = {};
-  // Global totals
-  stats.global[type] = (stats.global[type] || 0) + 1;
-  // Per-user totals + history
-  if (!stats.byUser[email]) stats.byUser[email] = { testPlans: 0, testCases: 0, autoScripts: 0, history: [] };
-  stats.byUser[email][type] = (stats.byUser[email][type] || 0) + 1;
-  stats.byUser[email].history.push({ date: new Date().toISOString().slice(0, 10), type });
-  // Keep only last 365 history entries per user
-  if (stats.byUser[email].history.length > 365) {
-    stats.byUser[email].history = stats.byUser[email].history.slice(-365);
-  }
-  await writeJson(DB.statsFile, stats);
-}
-
-function buildChartData(allHistory) {
-  // Last 6 months, all users combined
-  const now = new Date();
-  const months = [];
-  for (let i = 5; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    months.push({ key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, label: d.toLocaleString('default', { month: 'short', year: '2-digit' }) });
-  }
-  const buckets = { testPlans: {}, testCases: {}, autoScripts: {} };
-  months.forEach(m => { buckets.testPlans[m.key] = 0; buckets.testCases[m.key] = 0; buckets.autoScripts[m.key] = 0; });
-  allHistory.forEach(({ date, type }) => {
-    const mk = date.slice(0, 7);
-    if (buckets[type] && buckets[type][mk] !== undefined) buckets[type][mk]++;
-  });
-  return {
-    labels: months.map(m => m.label),
-    testPlans: months.map(m => buckets.testPlans[m.key]),
-    testCases: months.map(m => buckets.testCases[m.key]),
-    autoScripts: months.map(m => buckets.autoScripts[m.key])
-  };
-}
-
-// ─── Google token verification ───────────────────────────────────────────────
 function verifyGoogleToken(idToken) {
   return new Promise((resolve, reject) => {
-    const url = `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`;
-    const u = new URL(url);
-    const opts = { hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers: { Accept: 'application/json' } };
-    const req = https.request(opts, res => {
-      let chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          if (data.error_description || data.error) return reject(new Error(data.error_description || data.error));
-          if (CONFIG.googleClientId && data.aud !== CONFIG.googleClientId) return reject(new Error('Token audience mismatch'));
-          resolve(data);
-        } catch (e) { reject(e); }
-      });
+    const u = new URL(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+    const req = https.request({ hostname: u.hostname, path: u.pathname+u.search, method:'GET', headers:{Accept:'application/json'} }, res => {
+      let raw=''; res.on('data', c => { raw+=c; });
+      res.on('end', () => { try { const d=JSON.parse(raw); if(d.error_description||d.error)return reject(new Error(d.error_description||d.error)); if(CONFIG.googleClientId&&d.aud!==CONFIG.googleClientId)return reject(new Error('Token audience mismatch')); resolve(d); } catch(e){reject(e);} });
     });
-    req.on('error', reject);
-    req.setTimeout(8000, () => { req.destroy(); reject(new Error('Google token verify timeout')); });
-    req.end();
+    req.on('error',reject); req.setTimeout(8000,()=>{req.destroy();reject(new Error('timeout'));}); req.end();
   });
 }
 
 class AtlassianClient {
-  constructor({ email, apiToken, siteUrl }) {
-    this.email = email;
-    this.apiToken = apiToken;
-    this.siteUrl = siteUrl;
-    this.timeout = CONFIG.mcp.timeout;
-  }
-  _authHeader() {
-    const b64 = Buffer.from(`${this.email}:${this.apiToken}`).toString('base64');
-    return `Basic ${b64}`;
-  }
-  _request(method, urlPath, body) {
+  constructor({ email, apiToken, siteUrl }) { this.email=email; this.apiToken=apiToken; this.siteUrl=siteUrl; this.timeout=CONFIG.mcp.timeout; }
+  _auth() { return `Basic ${Buffer.from(`${this.email}:${this.apiToken}`).toString('base64')}`; }
+  _req(method, urlPath, body) {
     return new Promise((resolve, reject) => {
       const url = new URL(urlPath, `https://${this.siteUrl}`);
-      const opts = {
-        method,
-        hostname: url.hostname,
-        path: url.pathname + url.search,
-        headers: {
-          Authorization: this._authHeader(),
-          Accept: 'application/json',
-          'User-Agent': 'qubit-server/1.0'
-        },
-        timeout: this.timeout
-      };
-      if (body) {
-        const payload = JSON.stringify(body);
-        opts.headers['Content-Type'] = 'application/json';
-        opts.headers['Content-Length'] = Buffer.byteLength(payload);
-      }
-      const req = https.request(opts, res => {
-        let chunks = [];
-        res.on('data', c => chunks.push(c));
-        res.on('end', () => {
-          const raw = Buffer.concat(chunks).toString('utf8');
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            try { resolve(JSON.parse(raw)); } catch { resolve(raw); }
-          } else {
-            const err = new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 300)}`);
-            err.statusCode = res.statusCode;
-            reject(err);
-          }
-        });
-      });
-      req.on('error', reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout ${this.timeout}ms`)); });
-      if (body) req.write(JSON.stringify(body));
-      req.end();
+      const opts = { method, hostname:url.hostname, path:url.pathname+url.search, headers:{Authorization:this._auth(),Accept:'application/json','User-Agent':'qubit/1.3'}, timeout:this.timeout };
+      if(body){const p=JSON.stringify(body);opts.headers['Content-Type']='application/json';opts.headers['Content-Length']=Buffer.byteLength(p);}
+      const r=https.request(opts,res=>{let c=[];res.on('data',d=>c.push(d));res.on('end',()=>{const raw=Buffer.concat(c).toString('utf8');if(res.statusCode>=200&&res.statusCode<300){try{resolve(JSON.parse(raw));}catch{resolve(raw);}}else{const e=new Error(`HTTP ${res.statusCode}: ${raw.slice(0,300)}`);e.statusCode=res.statusCode;reject(e);}});});
+      r.on('error',reject);r.on('timeout',()=>{r.destroy();reject(new Error(`Timeout ${this.timeout}ms`));});
+      if(body)r.write(JSON.stringify(body));r.end();
     });
   }
-  async withRetry(label, fn, maxRetries = CONFIG.mcp.maxRetries, onLog) {
-    let attempt = 0; let lastErr;
-    while (attempt < maxRetries) {
-      try { return await fn(); }
-      catch (err) {
-        attempt++; lastErr = err;
-        if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500 && err.statusCode !== 429) throw err;
-        const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-        if (onLog) onLog(`⚠ ${label} attempt ${attempt} failed (${err.message}) — retry in ${Math.round(backoff/1000)}s`, 'warn');
-        await new Promise(r => setTimeout(r, backoff));
-      }
-    }
-    throw new Error(`${label} failed after ${maxRetries} retries: ${lastErr.message}`);
+  async withRetry(label, fn, max=CONFIG.mcp.maxRetries, onLog) {
+    let attempt=0,lastErr;
+    while(attempt<max){try{return await fn();}catch(err){attempt++;lastErr=err;if(err.statusCode&&err.statusCode>=400&&err.statusCode<500&&err.statusCode!==429)throw err;const b=Math.min(1000*Math.pow(2,attempt-1),8000);if(onLog)onLog(`⚠ ${label} retry in ${Math.round(b/1000)}s`,'warn');await new Promise(r=>setTimeout(r,b));}}
+    throw new Error(`${label} failed after ${max} retries: ${lastErr.message}`);
   }
-  async ping() { return this._request('GET', '/rest/api/3/myself'); }
-  async getIssue(issueKey, fields) {
-    const fieldParam = fields ? `?fields=${fields.join(',')}` : '';
-    return this._request('GET', `/rest/api/3/issue/${issueKey}${fieldParam}`);
-  }
-  async searchByJql(jql, fields = ['summary', 'status', 'issuetype'], maxResults = 100) {
-    const allIssues = [];
-    let nextPageToken = null;
-    let safetyCounter = 0;
-    const maxPages = 10;
-    do {
-      const payload = { jql, fields, maxResults };
-      if (nextPageToken) payload.nextPageToken = nextPageToken;
-      const res = await this._request('POST', '/rest/api/3/search/jql', payload);
-      if (Array.isArray(res.issues)) allIssues.push(...res.issues);
-      nextPageToken = res.nextPageToken || null;
-      safetyCounter++;
-      if (res.isLast === true) break;
-      if (!nextPageToken) break;
-      if (safetyCounter >= maxPages) break;
-    } while (true);
-    return { issues: allIssues };
+  async ping() { return this._req('GET','/rest/api/3/myself'); }
+  async getIssue(k,fields) { return this._req('GET',`/rest/api/3/issue/${k}${fields?'?fields='+fields.join(','):''}`); }
+  async searchByJql(jql,fields=['summary','status','issuetype'],maxResults=100) {
+    const all=[]; let nextPageToken=null,safety=0;
+    do { const p={jql,fields,maxResults}; if(nextPageToken)p.nextPageToken=nextPageToken; const r=await this._req('POST','/rest/api/3/search/jql',p); if(Array.isArray(r.issues))all.push(...r.issues); nextPageToken=r.nextPageToken||null; safety++; if(r.isLast===true||!nextPageToken||safety>=10)break; } while(true);
+    return { issues: all };
   }
 }
 
 function adfToPlainText(adf) {
-  if (!adf) return '';
-  if (typeof adf === 'string') return adf;
-  if (!adf.content) return '';
-  let out = '';
-  const walk = node => {
-    if (node.type === 'text' && node.text) out += node.text;
-    if (node.type === 'hardBreak') out += '\n';
-    if (node.type === 'paragraph' || node.type === 'heading') {
-      (node.content || []).forEach(walk); out += '\n';
-    } else if (node.type === 'bulletList' || node.type === 'orderedList') {
-      (node.content || []).forEach(item => {
-        out += '• '; (item.content || []).forEach(walk); out += '\n';
-      });
-    } else if (node.content) node.content.forEach(walk);
-  };
-  adf.content.forEach(walk);
-  return out.trim();
+  if(!adf)return''; if(typeof adf==='string')return adf; if(!adf.content)return'';
+  let out='';
+  const walk=node=>{if(node.type==='text'&&node.text)out+=node.text;if(node.type==='hardBreak')out+='\n';if(node.type==='paragraph'||node.type==='heading'){(node.content||[]).forEach(walk);out+='\n';}else if(node.type==='bulletList'||node.type==='orderedList'){(node.content||[]).forEach(item=>{out+='• ';(item.content||[]).forEach(walk);out+='\n';});}else if(node.content)node.content.forEach(walk);};
+  adf.content.forEach(walk); return out.trim();
 }
 
 function extractAcceptanceCriteria(descText) {
-  if (!descText) return [];
-  const lines = descText.split('\n').map(l => l.trim()).filter(Boolean);
-  const bullets = [];
-  let inAcSection = false;
-  for (const line of lines) {
-    if (/^(acceptance criteria|requirements|ac:|scenarios|given|when|then|definition of done)/i.test(line)) { inAcSection = true; continue; }
-    if (inAcSection) {
-      if (/^(#|##|background|notes?|open questions|out of scope|implementation|technical)/i.test(line)) { inAcSection = false; continue; }
-      const m = line.match(/^[•\-\*]\s*(.+)/) || line.match(/^\d+[\.\)]\s*(.+)/);
-      if (m) bullets.push(m[1].trim());
-    }
-  }
-  if (bullets.length === 0) {
-    for (const line of lines) {
-      const m = line.match(/^[•\-\*]\s*(.{15,})/);
-      if (m) bullets.push(m[1].trim());
-      if (bullets.length >= 12) break;
-    }
-  }
-  return bullets.slice(0, 15);
+  if(!descText)return[];
+  const lines=descText.split('\n').map(l=>l.trim()).filter(Boolean),bullets=[];let inAc=false;
+  for(const line of lines){if(/^(acceptance criteria|requirements|ac:|scenarios|given|when|then|definition of done)/i.test(line)){inAc=true;continue;}if(inAc){if(/^(#|##|background|notes?|open questions|out of scope|implementation|technical)/i.test(line)){inAc=false;continue;}const m=line.match(/^[•\-\*]\s*(.+)/)||line.match(/^\d+[\.\)]\s*(.+)/);if(m)bullets.push(m[1].trim());}}
+  if(bullets.length===0){for(const line of lines){const m=line.match(/^[•\-\*]\s*(.{15,})/);if(m)bullets.push(m[1].trim());if(bullets.length>=12)break;}}
+  return bullets.slice(0,15);
 }
 
 async function fetchStoriesParallel(client, stories, onLog) {
-  const workerCount = Math.min(CONFIG.mcp.parallelWorkers, stories.length);
-  const results = new Array(stories.length);
-  let idx = 0;
-  if (onLog) onLog(`▶ ${workerCount} parallel workers for ${stories.length} stories`, 'info');
-  const worker = async workerId => {
-    while (idx < stories.length) {
-      const i = idx++;
-      if (i >= stories.length) return;
-      const story = stories[i];
-      if (onLog) onLog(`  worker-${workerId} → fetching ${story.key}`);
-      try {
-        const detail = await client.withRetry(`getIssue(${story.key})`,
-          () => client.getIssue(story.key, ['summary', 'description', 'status', 'priority', 'assignee']),
-          CONFIG.mcp.maxRetries, onLog);
-        const descText = adfToPlainText(detail.fields.description);
-        results[i] = {
-          id: detail.key,
-          title: detail.fields.summary,
-          desc: descText.slice(0, 3000),   // full description for meaningful scenario generation
-          ac: extractAcceptanceCriteria(descText)
-        };
-        if (onLog) onLog(`  worker-${workerId} ✓ ${story.key} (${i + 1}/${stories.length})`, 'ok');
-      } catch (err) {
-        if (onLog) onLog(`  worker-${workerId} ✗ ${story.key} — ${err.message}`, 'err');
-        results[i] = {
-          id: story.key,
-          title: (story.fields && story.fields.summary) || story.key,
-          desc: '(description unavailable)',
-          ac: ['Acceptance criteria unavailable']
-        };
-      }
-    }
-  };
-  const workers = [];
-  for (let w = 1; w <= workerCount; w++) workers.push(worker(w));
-  await Promise.all(workers);
+  const workerCount=Math.min(CONFIG.mcp.parallelWorkers,stories.length),results=new Array(stories.length);let idx=0;
+  if(onLog)onLog(`▶ ${workerCount} parallel workers for ${stories.length} stories`,'info');
+  const worker=async wid=>{while(idx<stories.length){const i=idx++;if(i>=stories.length)return;const story=stories[i];if(onLog)onLog(`  worker-${wid} → fetching ${story.key}`);try{const d=await client.withRetry(`getIssue(${story.key})`,()=>client.getIssue(story.key,['summary','description','status','priority','assignee']),CONFIG.mcp.maxRetries,onLog);const dt=adfToPlainText(d.fields.description);results[i]={id:d.key,title:d.fields.summary,desc:dt.slice(0,3000),ac:extractAcceptanceCriteria(dt)};if(onLog)onLog(`  worker-${wid} ✓ ${story.key} (${i+1}/${stories.length})`,'ok');}catch(err){if(onLog)onLog(`  worker-${wid} ✗ ${story.key} — ${err.message}`,'err');results[i]={id:story.key,title:(story.fields&&story.fields.summary)||story.key,desc:'(description unavailable)',ac:['Acceptance criteria unavailable']};}}};
+  await Promise.all(Array.from({length:workerCount},(_,i)=>worker(i+1)));
   return results;
 }
 
+// Express App
 const app = express();
 app.use(cors({ origin: CONFIG.corsOrigin, credentials: true }));
-app.use(express.json({ limit: '5mb' }));
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-  next();
-});
+app.use(express.json({ limit: '10mb' }));
+app.use((req,_,next)=>{console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);next();});
 
-// ══════════════════════════════════════════════════════════
-// AUTH — REGISTER (supports optional invite token)
-// ══════════════════════════════════════════════════════════
+// REGISTER
 app.post('/api/auth/register', async (req, res) => {
   const { firstName, lastName, email, phone, org, role, password, avatar, inviteToken } = req.body || {};
-  if (!firstName || !lastName || !email || !org || !role || !password) return res.status(400).json({ error: 'Missing required fields' });
-  if (!domainOk(email)) return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} emails allowed` });
-  if (!passwordValid(password)) return res.status(400).json({ error: 'Password must be 8+ chars with uppercase, number, symbol' });
-
-  // Validate invite token if provided
-  const emailLower = email.toLowerCase();
-  if (inviteToken) {
-    const invites = await readJson(DB.invitesFile);
-    const invite = invites[inviteToken];
-    if (!invite) return res.status(400).json({ error: 'Invalid or expired invite link' });
-    if (Date.now() > invite.expiresAt) {
-      delete invites[inviteToken];
-      await writeJson(DB.invitesFile, invites);
-      return res.status(400).json({ error: 'Invite link has expired' });
-    }
-    if (invite.email.toLowerCase() !== emailLower) return res.status(400).json({ error: 'Email does not match invite' });
-    // Consume invite
-    delete invites[inviteToken];
-    await writeJson(DB.invitesFile, invites);
-  }
-
-  const users = await readJson(DB.usersFile);
-  if (users[emailLower]) return res.status(409).json({ error: 'Account already exists' });
-  const initials = (firstName[0] + lastName[0]).toUpperCase();
-  const user = {
-    firstName, lastName, fullName: `${firstName} ${lastName}`,
-    email: emailLower, phone: phone || '', org, role, bio: '', initials,
-    avatar: avatar || { type: 'initials' },
-    passwordHash: hashPassword(password, emailLower),
-    createdAt: new Date().toISOString()
-  };
-  users[emailLower] = user;
-  await writeJson(DB.usersFile, users);
-  const token = createToken();
-  const sessions = await readJson(DB.sessionsFile);
-  sessions[token] = { email: emailLower, createdAt: Date.now() };
-  await writeJson(DB.sessionsFile, sessions);
-  const { passwordHash, ...publicUser } = user;
-  res.json({ user: publicUser, token });
+  if(!firstName||!lastName||!email||!org||!role||!password)return res.status(400).json({error:'Missing required fields'});
+  if(!domainOk(email))return res.status(403).json({error:`Only ${CONFIG.allowedDomains.join(' / ')} emails allowed`});
+  if(!passwordValid(password))return res.status(400).json({error:'Password must be 8+ chars with uppercase, number, symbol'});
+  const emailLower=email.toLowerCase();
+  if(inviteToken){const invite=await getInvite(inviteToken);if(!invite)return res.status(400).json({error:'Invalid or expired invite link'});if(Date.now()>invite.expiresAt){await deleteInvite(inviteToken);return res.status(400).json({error:'Invite link has expired'});}if(invite.email.toLowerCase()!==emailLower)return res.status(400).json({error:'Email does not match invite'});await deleteInvite(inviteToken);}
+  if(await getUser(emailLower))return res.status(409).json({error:'Account already exists'});
+  const initials=(firstName[0]+lastName[0]).toUpperCase();
+  const user={firstName,lastName,fullName:`${firstName} ${lastName}`,email:emailLower,phone:phone||'',org,role,bio:'',initials,avatar:avatar||{type:'initials'},passwordHash:hashPassword(password,emailLower),createdAt:new Date().toISOString()};
+  await saveUser(user);
+  const token=createToken();await createSession(token,emailLower);
+  const {passwordHash,...pub}=user;res.json({user:pub,token});
 });
 
-// ══════════════════════════════════════════════════════════
-// AUTH — LOGIN
-// ══════════════════════════════════════════════════════════
+// LOGIN
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'Missing credentials' });
-  const emailLower = email.toLowerCase();
-  const users = await readJson(DB.usersFile);
-  const user = users[emailLower];
-  if (!user || user.passwordHash !== hashPassword(password, emailLower)) return res.status(401).json({ error: 'Invalid credentials' });
-  const token = createToken();
-  const sessions = await readJson(DB.sessionsFile);
-  sessions[token] = { email: emailLower, createdAt: Date.now() };
-  await writeJson(DB.sessionsFile, sessions);
-  const { passwordHash, ...publicUser } = user;
-  res.json({ user: publicUser, token });
+  const {email,password}=req.body||{};
+  if(!email||!password)return res.status(400).json({error:'Missing credentials'});
+  const emailLower=email.toLowerCase();
+  const user=await getUser(emailLower);
+  if(!user||user.passwordHash!==hashPassword(password,emailLower))return res.status(401).json({error:'Invalid credentials'});
+  const token=createToken();await createSession(token,emailLower);
+  const {passwordHash,...pub}=user;res.json({user:pub,token});
 });
 
-// ══════════════════════════════════════════════════════════
-// AUTH — GOOGLE SSO
-// ══════════════════════════════════════════════════════════
+// GOOGLE SSO
 app.post('/api/auth/google', async (req, res) => {
-  const { credential } = req.body || {};
-  if (!credential) return res.status(400).json({ error: 'Google credential required' });
-  let payload;
-  try {
-    payload = await verifyGoogleToken(credential);
-  } catch (err) {
-    return res.status(401).json({ error: `Google verification failed: ${err.message}` });
-  }
-  const email = (payload.email || '').toLowerCase();
-  if (!email) return res.status(400).json({ error: 'No email in Google token' });
-  if (!domainOk(email)) return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} accounts allowed` });
-
-  const users = await readJson(DB.usersFile);
-  let user = users[email];
-  if (!user) {
-    // Auto-create user from Google profile
-    const firstName = payload.given_name || email.split('@')[0];
-    const lastName = payload.family_name || '';
-    const initials = ((firstName[0] || '') + (lastName[0] || '')).toUpperCase() || '?';
-    user = {
-      firstName, lastName, fullName: payload.name || firstName,
-      email, phone: '', org: email.split('@')[1], role: 'Other', bio: '', initials,
-      avatar: payload.picture ? { type: 'photo', data: payload.picture } : { type: 'initials' },
-      passwordHash: '',
-      googleSub: payload.sub,
-      createdAt: new Date().toISOString()
-    };
-    users[email] = user;
-    await writeJson(DB.usersFile, users);
-  }
-  const token = createToken();
-  const sessions = await readJson(DB.sessionsFile);
-  sessions[token] = { email, createdAt: Date.now() };
-  await writeJson(DB.sessionsFile, sessions);
-  const { passwordHash, ...publicUser } = user;
-  res.json({ user: publicUser, token });
+  const {credential}=req.body||{};if(!credential)return res.status(400).json({error:'Google credential required'});
+  let payload;try{payload=await verifyGoogleToken(credential);}catch(err){return res.status(401).json({error:`Google verification failed: ${err.message}`});}
+  const email=(payload.email||'').toLowerCase();if(!email)return res.status(400).json({error:'No email in Google token'});
+  if(!domainOk(email))return res.status(403).json({error:`Only ${CONFIG.allowedDomains.join(' / ')} accounts allowed`});
+  let user=await getUser(email);
+  if(!user){const fn=payload.given_name||email.split('@')[0],ln=payload.family_name||'';const ini=((fn[0]||'')+(ln[0]||'')).toUpperCase()||'?';user={firstName:fn,lastName:ln,fullName:payload.name||fn,email,phone:'',org:email.split('@')[1],role:'Other',bio:'',initials:ini,avatar:payload.picture?{type:'photo',data:payload.picture}:{type:'initials'},passwordHash:'',googleSub:payload.sub,createdAt:new Date().toISOString()};await saveUser(user);}
+  const token=createToken();await createSession(token,email);
+  const {passwordHash,...pub}=user;res.json({user:pub,token});
 });
 
-// ══════════════════════════════════════════════════════════
-// AUTH — SELF-SERVICE REGISTRATION REQUEST (sends real email)
-// ══════════════════════════════════════════════════════════
+// SELF-SERVICE REGISTER REQUEST
 app.post('/api/auth/request-register', async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) return res.status(400).json({ error: 'Email required' });
-  const emailLower = email.toLowerCase().trim();
-  if (!domainOk(emailLower)) {
-    return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} emails are allowed` });
-  }
-  const users = await readJson(DB.usersFile);
-  if (users[emailLower]) {
-    return res.status(409).json({ error: 'An account already exists for this email. Please sign in.' });
-  }
-
-  // Reuse existing non-expired token for same email
-  const invites = await readJson(DB.invitesFile);
-  let token = null;
-  const existing = Object.entries(invites).find(([, v]) => v.email === emailLower && Date.now() < v.expiresAt);
-  if (existing) {
-    token = existing[0];
-  } else {
-    token = createToken();
-    invites[token] = {
-      email: emailLower,
-      invitedBy: null,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + CONFIG.regTokenExpiryMs
-    };
-    await writeJson(DB.invitesFile, invites);
-  }
-
-  const registrationUrl = `${CONFIG.frontendUrl}/?register=${token}`;
-
-  try {
-    await sendRegistrationEmail(emailLower, registrationUrl);
-    console.log(`[register] Email dispatched → ${emailLower}`);
-    res.json({ ok: true, email: emailLower });
-  } catch (err) {
-    console.error('[register] Email send failed:', err.message);
-    const is401 = err.message.includes('401');
-    res.status(500).json({
-      error: is401
-        ? 'Mailgun authentication failed (401). Your MAILGUN_API_KEY is wrong — make sure you are using the Private API Key from the Mailgun dashboard, NOT the SMTP password.'
-        : 'Failed to send registration email: ' + err.message,
-      hint: 'Mailgun dashboard → Settings → API Keys → Private API key (starts with key-...)'
-    });
-  }
+  const {email}=req.body||{};if(!email)return res.status(400).json({error:'Email required'});
+  const emailLower=email.toLowerCase().trim();
+  if(!domainOk(emailLower))return res.status(403).json({error:`Only ${CONFIG.allowedDomains.join(' / ')} emails are allowed`});
+  if(await getUser(emailLower))return res.status(409).json({error:'An account already exists for this email. Please sign in.'});
+  let tokenVal=null;const ei=await findUnexpiredInvite(emailLower);
+  if(ei){tokenVal=ei.token;}else{tokenVal=createToken();await saveInvite(tokenVal,emailLower,null,Date.now()+CONFIG.regTokenExpiryMs);}
+  const registrationUrl=`${CONFIG.frontendUrl}/?register=${tokenVal}`;
+  try{await sendRegistrationEmail(emailLower,registrationUrl);res.json({ok:true,email:emailLower});}
+  catch(err){console.error('[register]',err.message);res.status(500).json({error:'Failed to send registration email: '+err.message});}
 });
 
 app.get('/api/auth/register-token/:token', async (req, res) => {
-  const invites = await readJson(DB.invitesFile);
-  const invite = invites[req.params.token];
-  if (!invite) return res.status(404).json({ error: 'Invalid registration link' });
-  if (Date.now() > invite.expiresAt) {
-    delete invites[req.params.token];
-    await writeJson(DB.invitesFile, invites);
-    return res.status(410).json({ error: 'Registration link has expired. Please request a new one.' });
-  }
-  res.json({ email: invite.email, expiresAt: invite.expiresAt });
+  const invite=await getInvite(req.params.token);if(!invite)return res.status(404).json({error:'Invalid registration link'});
+  if(Date.now()>invite.expiresAt){await deleteInvite(req.params.token);return res.status(410).json({error:'Registration link has expired.'});}
+  res.json({email:invite.email,expiresAt:invite.expiresAt});
 });
 
-// ══════════════════════════════════════════════════════════
-// AUTH — INVITE (create + verify) — for logged-in users
-// ══════════════════════════════════════════════════════════
-app.post('/api/auth/invite', authMiddleware, async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) return res.status(400).json({ error: 'Email required' });
-  const emailLower = email.toLowerCase();
-  if (!domainOk(emailLower)) return res.status(403).json({ error: `Only ${CONFIG.allowedDomains.join(' / ')} emails allowed` });
-  const users = await readJson(DB.usersFile);
-  if (users[emailLower]) return res.status(409).json({ error: 'User already exists with this email' });
-
-  const invites = await readJson(DB.invitesFile);
-  // Check for existing non-expired invite
-  const existing = Object.entries(invites).find(([, v]) => v.email === emailLower && Date.now() < v.expiresAt);
-  if (existing) {
-    const inviteUrl = `${CONFIG.frontendUrl}/?register=${existing[0]}`;
-    return res.json({ ok: true, inviteUrl, expiresAt: invites[existing[0]].expiresAt, reused: true });
-  }
-
-  const token = createToken();
-  invites[token] = {
-    email: emailLower,
-    invitedBy: req.user.email,
-    createdAt: Date.now(),
-    expiresAt: Date.now() + CONFIG.inviteExpiryMs
-  };
-  await writeJson(DB.invitesFile, invites);
-  const inviteUrl = `${CONFIG.frontendUrl}/?register=${token}`;
-  console.log(`[invite] ${req.user.email} invited ${emailLower} → ${inviteUrl}`);
-  res.json({ ok: true, inviteUrl, expiresAt: invites[token].expiresAt });
-});
-
-app.get('/api/auth/invite/:token', async (req, res) => {
-  const invites = await readJson(DB.invitesFile);
-  const invite = invites[req.params.token];
-  if (!invite) return res.status(404).json({ error: 'Invalid invite link' });
-  if (Date.now() > invite.expiresAt) {
-    delete invites[req.params.token];
-    await writeJson(DB.invitesFile, invites);
-    return res.status(410).json({ error: 'Invite link has expired' });
-  }
-  res.json({ email: invite.email, invitedBy: invite.invitedBy, expiresAt: invite.expiresAt });
-});
-
-// ══════════════════════════════════════════════════════════
-// AUTH — LOGOUT / ME / PROFILE / PASSWORD
-// ══════════════════════════════════════════════════════════
-app.post('/api/auth/logout', authMiddleware, async (req, res) => {
-  const sessions = await readJson(DB.sessionsFile);
-  delete sessions[req.token];
-  await writeJson(DB.sessionsFile, sessions);
-  res.json({ ok: true });
-});
-
-app.get('/api/auth/me', authMiddleware, (req, res) => {
-  const { passwordHash, ...publicUser } = req.user;
-  res.json({ user: publicUser });
-});
-
+// LOGOUT / ME / PROFILE / PASSWORD
+app.post('/api/auth/logout', authMiddleware, async (req, res) => { await deleteSession(req.token); res.json({ok:true}); });
+app.get('/api/auth/me', authMiddleware, (req, res) => { const {passwordHash,...pub}=req.user; res.json({user:pub}); });
 app.put('/api/auth/profile', authMiddleware, async (req, res) => {
-  const { firstName, lastName, org, role, phone, bio, avatar } = req.body || {};
-  const users = await readJson(DB.usersFile);
-  const user = users[req.user.email];
-  if (firstName) user.firstName = firstName;
-  if (lastName) user.lastName = lastName;
-  if (firstName && lastName) {
-    user.fullName = `${firstName} ${lastName}`;
-    user.initials = (firstName[0] + lastName[0]).toUpperCase();
-  }
-  if (org !== undefined) user.org = org;
-  if (role !== undefined) user.role = role;
-  if (phone !== undefined) user.phone = phone;
-  if (bio !== undefined) user.bio = bio;
-  if (avatar !== undefined) user.avatar = avatar;
-  await writeJson(DB.usersFile, users);
-  const { passwordHash, ...publicUser } = user;
-  res.json({ user: publicUser });
+  const {firstName,lastName,org,role,phone,bio,avatar}=req.body||{};const user={...req.user};
+  if(firstName)user.firstName=firstName;if(lastName)user.lastName=lastName;
+  if(firstName&&lastName){user.fullName=`${firstName} ${lastName}`;user.initials=(firstName[0]+lastName[0]).toUpperCase();}
+  if(org!==undefined)user.org=org;if(role!==undefined)user.role=role;if(phone!==undefined)user.phone=phone;if(bio!==undefined)user.bio=bio;if(avatar!==undefined)user.avatar=avatar;
+  await saveUser(user);const {passwordHash,...pub}=user;res.json({user:pub});
 });
-
 app.post('/api/auth/password', authMiddleware, async (req, res) => {
-  const { oldPassword, newPassword } = req.body || {};
-  if (!oldPassword || !newPassword) return res.status(400).json({ error: 'Both old and new password required' });
-  const users = await readJson(DB.usersFile);
-  const user = users[req.user.email];
-  if (!user || user.passwordHash !== hashPassword(oldPassword, req.user.email)) {
-    return res.status(401).json({ error: 'Current password is incorrect' });
-  }
-  if (!passwordValid(newPassword)) {
-    return res.status(400).json({ error: 'New password must be 8+ chars with uppercase, lowercase, number, and symbol' });
-  }
-  if (oldPassword === newPassword) {
-    return res.status(400).json({ error: 'New password must be different from current password' });
-  }
-  user.passwordHash = hashPassword(newPassword, req.user.email);
-  await writeJson(DB.usersFile, users);
-  // Invalidate all existing sessions except current
-  const sessions = await readJson(DB.sessionsFile);
-  Object.keys(sessions).forEach(t => {
-    if (sessions[t].email === req.user.email && t !== req.token) delete sessions[t];
-  });
-  await writeJson(DB.sessionsFile, sessions);
-  res.json({ ok: true, message: 'Password updated successfully' });
+  const {oldPassword,newPassword}=req.body||{};if(!oldPassword||!newPassword)return res.status(400).json({error:'Both old and new password required'});
+  const user={...req.user};if(!user||user.passwordHash!==hashPassword(oldPassword,req.user.email))return res.status(401).json({error:'Current password is incorrect'});
+  if(!passwordValid(newPassword))return res.status(400).json({error:'New password must be 8+ chars with uppercase, lowercase, number, and symbol'});
+  if(oldPassword===newPassword)return res.status(400).json({error:'New password must be different'});
+  user.passwordHash=hashPassword(newPassword,req.user.email);await saveUser(user);await deleteUserSessions(req.user.email,req.token);
+  res.json({ok:true,message:'Password updated successfully'});
 });
 
-// ══════════════════════════════════════════════════════════
-// STATS DASHBOARD
-// ══════════════════════════════════════════════════════════
+// INVITE
+app.post('/api/auth/invite', authMiddleware, async (req, res) => {
+  const {email}=req.body||{};if(!email)return res.status(400).json({error:'Email required'});
+  const emailLower=email.toLowerCase();if(!domainOk(emailLower))return res.status(403).json({error:`Only ${CONFIG.allowedDomains.join(' / ')} emails allowed`});
+  if(await getUser(emailLower))return res.status(409).json({error:'User already exists'});
+  const ei=await findUnexpiredInvite(emailLower);
+  if(ei)return res.json({ok:true,inviteUrl:`${CONFIG.frontendUrl}/?register=${ei.token}`,expiresAt:ei.expiresAt,reused:true});
+  const token=createToken();await saveInvite(token,emailLower,req.user.email,Date.now()+CONFIG.inviteExpiryMs);
+  res.json({ok:true,inviteUrl:`${CONFIG.frontendUrl}/?register=${token}`,expiresAt:Date.now()+CONFIG.inviteExpiryMs});
+});
+app.get('/api/auth/invite/:token', async (req, res) => {
+  const invite=await getInvite(req.params.token);if(!invite)return res.status(404).json({error:'Invalid invite link'});
+  if(Date.now()>invite.expiresAt){await deleteInvite(req.params.token);return res.status(410).json({error:'Invite expired'});}
+  res.json({email:invite.email,invitedBy:invite.invitedBy,expiresAt:invite.expiresAt});
+});
+
+// STATS DASHBOARD (range-aware)
 app.get('/api/stats/dashboard', authMiddleware, async (req, res) => {
-  const stats = await readJson(DB.statsFile, { global: {}, byUser: {} });
-  const myStats = stats.byUser[req.user.email] || { testPlans: 0, testCases: 0, autoScripts: 0, history: [] };
-  const globalStats = stats.global || { testPlans: 0, testCases: 0, autoScripts: 0 };
-
-  // Aggregate all-user history for chart
-  const allHistory = [];
-  Object.values(stats.byUser || {}).forEach(u => (u.history || []).forEach(h => allHistory.push(h)));
-
-  const chart = buildChartData(allHistory);
-
-  // Also count registered users
-  const users = await readJson(DB.usersFile);
-  const totalUsers = Object.keys(users).length;
-
-  res.json({
-    my: { testPlans: myStats.testPlans || 0, testCases: myStats.testCases || 0, autoScripts: myStats.autoScripts || 0 },
-    global: { testPlans: globalStats.testPlans || 0, testCases: globalStats.testCases || 0, autoScripts: globalStats.autoScripts || 0, users: totalUsers },
-    chart
-  });
+  const range=req.query.range||'month';
+  const rows=await getStatsForRange(range);
+  const chart=buildChartData(rows,range);
+  const myRows=await db('SELECT stat_type,COUNT(*)::int AS cnt FROM stat_events WHERE email=$1 GROUP BY stat_type',[req.user.email]);
+  const glRows=await db('SELECT stat_type,COUNT(*)::int AS cnt FROM stat_events GROUP BY stat_type',[]);
+  const myMap={},glMap={};myRows.rows.forEach(r=>{myMap[r.stat_type]=r.cnt;});glRows.rows.forEach(r=>{glMap[r.stat_type]=r.cnt;});
+  const totalUsers=await getUserCount();
+  res.json({my:{testPlans:myMap.testPlans||0,testCases:myMap.testCases||0,autoScripts:myMap.autoScripts||0},global:{testPlans:glMap.testPlans||0,testCases:glMap.testCases||0,autoScripts:glMap.autoScripts||0,users:totalUsers},chart,range});
 });
 
-// ══════════════════════════════════════════════════════════
 // CONNECTORS
-// ══════════════════════════════════════════════════════════
 app.get('/api/connectors/status', authMiddleware, async (req, res) => {
-  const all = await readJson(DB.connectorsFile);
-  const mine = all[req.user.email] || {};
-  const safe = {};
-  Object.keys(mine).forEach(k => {
-    safe[k] = { connected: mine[k].connected, method: mine[k].method, connectedAt: mine[k].connectedAt };
-  });
-  res.json({ connectors: safe });
+  const data=await getConnectors(req.user.email);const safe={};
+  Object.keys(data).forEach(k=>{safe[k]={connected:data[k].connected,method:data[k].method,connectedAt:data[k].connectedAt};});
+  res.json({connectors:safe});
 });
-
 app.post('/api/connectors/jira/connect', authMiddleware, async (req, res) => {
-  const { apiToken, email: jiraEmail, siteUrl } = req.body || {};
-  if (!apiToken || !jiraEmail || !siteUrl) return res.status(400).json({ error: 'apiToken, email, siteUrl required' });
-  const normalizedSite = siteUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
-  const client = new AtlassianClient({ email: jiraEmail, apiToken, siteUrl: normalizedSite });
-  try {
-    const me = await client.ping();
-    const all = await readJson(DB.connectorsFile);
-    if (!all[req.user.email]) all[req.user.email] = {};
-    all[req.user.email].jira = {
-      connected: true, method: 'token', connectedAt: new Date().toISOString(),
-      apiToken, jiraEmail, siteUrl: normalizedSite,
-      accountId: me.accountId, displayName: me.displayName
-    };
-    await writeJson(DB.connectorsFile, all);
-    res.json({ connected: true, method: 'token',
-      jiraUser: { accountId: me.accountId, displayName: me.displayName, email: me.emailAddress } });
-  } catch (err) {
-    res.status(401).json({ error: `Jira auth failed: ${err.message}` });
-  }
+  const {apiToken,email:jiraEmail,siteUrl}=req.body||{};if(!apiToken||!jiraEmail||!siteUrl)return res.status(400).json({error:'apiToken, email, siteUrl required'});
+  const ns=siteUrl.replace(/^https?:\/\//,'').replace(/\/$/,'');const client=new AtlassianClient({email:jiraEmail,apiToken,siteUrl:ns});
+  try{const me=await client.ping();const data=await getConnectors(req.user.email);data.jira={connected:true,method:'token',connectedAt:new Date().toISOString(),apiToken,jiraEmail,siteUrl:ns,accountId:me.accountId,displayName:me.displayName};await saveConnectors(req.user.email,data);res.json({connected:true,method:'token',jiraUser:{accountId:me.accountId,displayName:me.displayName,email:me.emailAddress}});}
+  catch(err){res.status(401).json({error:`Jira auth failed: ${err.message}`});}
 });
-
 app.post('/api/connectors/jira/test', authMiddleware, async (req, res) => {
-  const all = await readJson(DB.connectorsFile);
-  const jira = (all[req.user.email] || {}).jira;
-  if (!jira || !jira.connected) return res.status(400).json({ error: 'Jira not connected' });
-  const steps = [];
-  const logStep = (ok, msg) => steps.push({ ok, msg, ts: Date.now() });
-  try {
-    const t0 = Date.now();
-    logStep(true, `Pinging ${jira.siteUrl}`);
-    const client = new AtlassianClient({ email: jira.jiraEmail, apiToken: jira.apiToken, siteUrl: jira.siteUrl });
-    const me = await client.ping();
-    logStep(true, `Authenticated as ${me.displayName}`);
-    const probe = await client.searchByJql('issuetype = Epic ORDER BY created DESC', ['summary'], 1);
-    logStep(true, `Probe JQL returned ${probe.issues.length} result(s)`);
-    const latency = Date.now() - t0;
-    logStep(true, `Latency: ${latency}ms`);
-    res.json({ ok: true, steps, latency, jiraUser: me.displayName });
-  } catch (err) {
-    logStep(false, err.message);
-    res.status(500).json({ ok: false, steps, error: err.message });
-  }
+  const data=await getConnectors(req.user.email);const jira=data.jira;if(!jira||!jira.connected)return res.status(400).json({error:'Jira not connected'});
+  const steps=[],logStep=(ok,msg)=>steps.push({ok,msg,ts:Date.now()});
+  try{const t0=Date.now();logStep(true,`Pinging ${jira.siteUrl}`);const client=new AtlassianClient({email:jira.jiraEmail,apiToken:jira.apiToken,siteUrl:jira.siteUrl});const me=await client.ping();logStep(true,`Authenticated as ${me.displayName}`);const p=await client.searchByJql('issuetype = Epic ORDER BY created DESC',['summary'],1);logStep(true,`Probe JQL returned ${p.issues.length} result(s)`);logStep(true,`Latency: ${Date.now()-t0}ms`);res.json({ok:true,steps,latency:Date.now()-t0,jiraUser:me.displayName});}
+  catch(err){logStep(false,err.message);res.status(500).json({ok:false,steps,error:err.message});}
 });
-
 app.delete('/api/connectors/:id', authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  const all = await readJson(DB.connectorsFile);
-  if (all[req.user.email] && all[req.user.email][id]) {
-    delete all[req.user.email][id];
-    await writeJson(DB.connectorsFile, all);
-  }
-  res.json({ ok: true });
+  const data=await getConnectors(req.user.email);if(data[req.params.id]){delete data[req.params.id];await saveConnectors(req.user.email,data);}res.json({ok:true});
 });
 
-// ══════════════════════════════════════════════════════════
-// TEST PLAN — GENERATE (with stats recording)
-// ══════════════════════════════════════════════════════════
+// TEST PLAN GENERATE
 app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
-  const { projectName, release, epics, context } = req.body || {};
-  if (!projectName || !Array.isArray(epics) || epics.length === 0) return res.status(400).json({ error: 'projectName and non-empty epics[] required' });
-  const allConns = await readJson(DB.connectorsFile);
-  const jira = (allConns[req.user.email] || {}).jira;
-  if (!jira || !jira.connected) return res.status(400).json({ error: 'Jira connector not configured' });
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
-
-  const send = (event, data) => {
-    try {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    } catch (e) { console.error('SSE write failed:', e.message); }
-  };
-  const log = (msg, level = 'info') => send('log', { msg, level, ts: Date.now() });
-  const phase = (idx, state, sub) => send('phase', { idx, state, sub });
-
-  const heartbeat = setInterval(() => {
-    try { res.write(': heartbeat\n\n'); } catch (e) {}
-  }, 15000);
-
+  const {projectName,release,epics,context}=req.body||{};
+  if(!projectName||!Array.isArray(epics)||epics.length===0)return res.status(400).json({error:'projectName and non-empty epics[] required'});
+  const connData=await getConnectors(req.user.email);const jira=connData.jira;
+  if(!jira||!jira.connected)return res.status(400).json({error:'Jira connector not configured'});
+  res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-cache');res.setHeader('Connection','keep-alive');res.setHeader('X-Accel-Buffering','no');res.flushHeaders();
+  const send=(event,data)=>{try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){}};
+  const log=(msg,level='info')=>send('log',{msg,level,ts:Date.now()});
+  const phase=(idx,state,sub)=>send('phase',{idx,state,sub});
+  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},15000);
   try {
     log(`╔═══ TEST PLAN GENERATION STARTED ═══`);
     log(`Project: ${projectName} · Epics: ${epics.join(', ')}`);
-    const client = new AtlassianClient({ email: jira.jiraEmail, apiToken: jira.apiToken, siteUrl: jira.siteUrl });
-    phase(0, 'active', '');
-    const me = await client.ping();
-    log(`✓ Authenticated as ${me.displayName}`, 'ok');
-    phase(0, 'done', `✓ ${me.displayName}`);
-    phase(1, 'active', `0 of ${epics.length}`);
-    const epicsMeta = [];
-    for (let i = 0; i < epics.length; i++) {
-      const id = epics[i];
-      log(`──── Epic ${i + 1}/${epics.length}: ${id} ────`);
-      const epic = await client.withRetry(`getIssue(${id})`,
-        () => client.getIssue(id, ['summary', 'description', 'status', 'assignee', 'reporter', 'duedate', 'priority']),
-        CONFIG.mcp.maxRetries, log);
-      const descText = adfToPlainText(epic.fields.description);
-      const epicData = {
-        key: epic.key, title: epic.fields.summary,
-        description: descText.slice(0, 800),
-        status: (epic.fields.status && epic.fields.status.name) || 'Unknown',
-        assignee: (epic.fields.assignee && epic.fields.assignee.displayName) || 'Unassigned',
-        reporter: (epic.fields.reporter && epic.fields.reporter.displayName) || 'Unknown',
-        dueDate: epic.fields.duedate || 'TBD',
-        priority: (epic.fields.priority && epic.fields.priority.name) || 'Medium'
-      };
-      epicsMeta.push({ id, meta: epicData });
-      log(`✓ Epic loaded: ${epicData.title}`, 'ok');
-      phase(1, 'active', `${i + 1} of ${epics.length}`);
-    }
-    phase(1, 'done', `${epics.length} epics fetched`);
-    phase(2, 'active', '');
-    const storyListByEpic = {};
-    let totalStories = 0;
-    for (const em of epicsMeta) {
-      const jql = `parent in (${em.id}) AND issuetype = Story`;
-      log(`JQL: "${jql}"`);
-      const searchResult = await client.withRetry(`searchByJql(${em.id})`,
-        () => client.searchByJql(jql, ['summary', 'status', 'issuetype'], 100),
-        CONFIG.mcp.maxRetries, log);
-      const issues = searchResult.issues || [];
-      storyListByEpic[em.id] = issues;
-      log(`✓ ${issues.length} stories for ${em.id}`, 'ok');
-      issues.forEach(s => log(`    • ${s.key} — ${s.fields && s.fields.summary}`));
-      totalStories += issues.length;
-    }
-    phase(2, 'done', `${totalStories} stories found`);
-
-    if (totalStories === 0) {
-      log(`⚠ No stories found for the given epics. Check JQL permissions or epic IDs.`, 'warn');
-    }
-
-    phase(3, 'active', `0 of ${totalStories}`);
-    const allEpics = [];
-    let done = 0;
-    for (const em of epicsMeta) {
-      const list = storyListByEpic[em.id];
-      const details = list.length > 0 ? await fetchStoriesParallel(client, list, log) : [];
-      allEpics.push({ id: em.id, meta: em.meta, stories: details });
-      done += list.length;
-      phase(3, 'active', `${done} of ${totalStories}`);
-    }
-    phase(3, 'done', `${totalStories} stories enriched`);
-    phase(4, 'active', 'writing summary.json');
-    const planId = crypto.randomBytes(8).toString('hex');
-    const summary = {
-      id: planId,
-      generatedAt: new Date().toISOString(),
-      generatedBy: req.user.email,
-      project: projectName,
-      release: release || 'Unscheduled',
-      context: context || '',
-      site: jira.siteUrl,
-      jiraUser: me.displayName,
-      epics: allEpics.map(e => ({
-        epicKey: e.id, epicTitle: e.meta.title,
-        epicDescription: e.meta.description, epicStatus: e.meta.status,
-        epicAssignee: e.meta.assignee, epicReporter: e.meta.reporter,
-        epicDueDate: e.meta.dueDate,
-        stories: e.stories.map(s => ({
-          storyKey: s.id, storyTitle: s.title,
-          description: s.desc, acceptanceCriteria: s.ac
-        }))
-      })),
-      totals: {
-        epics: allEpics.length, stories: totalStories,
-        acceptanceCriteria: allEpics.reduce((a, e) => a + e.stories.reduce((b, s) => b + s.ac.length, 0), 0)
-      }
-    };
-    const summaryFile = path.join(CONFIG.tempDir, `qubit_epic_summary_${planId}.json`);
-    await fs.writeFile(summaryFile, JSON.stringify(summary, null, 2));
-    log(`✓ Summary file written`, 'ok');
-    phase(4, 'done', 'summary.json written');
-    const index = await readJson(DB.planIndexFile);
-    if (!index[req.user.email]) index[req.user.email] = [];
-    index[req.user.email].push({ planId, project: projectName, epics, summaryFile, generatedAt: summary.generatedAt });
-    await writeJson(DB.planIndexFile, index);
-
-    // Record stat
-    try { await recordStat(req.user.email, 'testPlans'); } catch (e) { console.error('stat record failed:', e.message); }
-
-    phase(5, 'active', 'synthesizing');
-    phase(5, 'done', 'complete');
-    log(`╚═══ GENERATION COMPLETE ═══`, 'ok');
-    send('complete', {
-      planId, summary,
-      stats: {
-        epics: summary.totals.epics, stories: summary.totals.stories,
-        scenarios: summary.totals.stories * 3, ac: summary.totals.acceptanceCriteria
-      }
-    });
-  } catch (err) {
-    console.error('[generate] FAILED:', err);
-    try {
-      log(`╚═══ FAILED: ${err.message} ═══`, 'err');
-      send('error', { error: err.message || 'Unknown error' });
-    } catch (e) { console.error('Final SSE send failed:', e.message); }
-  } finally {
-    clearInterval(heartbeat);
-    try { res.end(); } catch (e) {}
-  }
+    const client=new AtlassianClient({email:jira.jiraEmail,apiToken:jira.apiToken,siteUrl:jira.siteUrl});
+    phase(0,'active','');const me=await client.ping();log(`✓ Authenticated as ${me.displayName}`,'ok');phase(0,'done',`✓ ${me.displayName}`);
+    phase(1,'active',`0 of ${epics.length}`);const epicsMeta=[];
+    for(let i=0;i<epics.length;i++){const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority']),CONFIG.mcp.maxRetries,log);const dt=adfToPlainText(epic.fields.description);epicsMeta.push({id,meta:{key:epic.key,title:epic.fields.summary,description:dt.slice(0,800),status:(epic.fields.status&&epic.fields.status.name)||'Unknown',assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',dueDate:epic.fields.duedate||'TBD',priority:(epic.fields.priority&&epic.fields.priority.name)||'Medium'}});log(`✓ Epic loaded: ${epicsMeta[epicsMeta.length-1].meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);}
+    phase(1,'done',`${epics.length} epics fetched`);phase(2,'active','');
+    const slbe={};let totalStories=0;
+    for(const em of epicsMeta){const jql=`parent in (${em.id}) AND issuetype = Story`;log(`JQL: "${jql}"`);const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const issues=sr.issues||[];slbe[em.id]=issues;log(`✓ ${issues.length} stories for ${em.id}`,'ok');issues.forEach(s=>log(`    • ${s.key} — ${s.fields&&s.fields.summary}`));totalStories+=issues.length;}
+    phase(2,'done',`${totalStories} stories found`);if(totalStories===0)log(`⚠ No stories found. Check JQL permissions.`,'warn');
+    phase(3,'active',`0 of ${totalStories}`);const allEpics=[];let done=0;
+    for(const em of epicsMeta){const list=slbe[em.id];const details=list.length>0?await fetchStoriesParallel(client,list,log):[];allEpics.push({id:em.id,meta:em.meta,stories:details});done+=list.length;phase(3,'active',`${done} of ${totalStories}`);}
+    phase(3,'done',`${totalStories} stories enriched`);phase(4,'active','saving to database');
+    const planId=crypto.randomBytes(8).toString('hex');
+    const summary={id:planId,generatedAt:new Date().toISOString(),generatedBy:req.user.email,generatedByName:req.user.fullName,project:projectName,release:release||'Unscheduled',context:context||'',site:jira.siteUrl,jiraUser:me.displayName,epics:allEpics.map(e=>({epicKey:e.id,epicTitle:e.meta.title,epicDescription:e.meta.description,epicStatus:e.meta.status,epicAssignee:e.meta.assignee,epicReporter:e.meta.reporter,epicDueDate:e.meta.dueDate,stories:e.stories.map(s=>({storyKey:s.id,storyTitle:s.title,description:s.desc,acceptanceCriteria:s.ac}))})),totals:{epics:allEpics.length,stories:totalStories,acceptanceCriteria:allEpics.reduce((a,e)=>a+e.stories.reduce((b,s)=>b+s.ac.length,0),0)}};
+    await savePlan(planId,req.user.email,projectName,release,epics,summary);
+    await recordStatEvent(req.user.email,'testPlans');
+    log(`✓ Plan saved to database`,'ok');phase(4,'done','saved to database');
+    phase(5,'active','synthesizing');phase(5,'done','complete');log(`╚═══ GENERATION COMPLETE ═══`,'ok');
+    send('complete',{planId,summary,stats:{epics:summary.totals.epics,stories:summary.totals.stories,scenarios:summary.totals.stories*4,ac:summary.totals.acceptanceCriteria}});
+  } catch(err) {
+    console.error('[generate] FAILED:',err);
+    try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}
+  } finally { clearInterval(hb);try{res.end();}catch(e){} }
 });
 
 app.get('/api/testplan/:id/summary', authMiddleware, async (req, res) => {
-  const index = await readJson(DB.planIndexFile);
-  const mine = index[req.user.email] || [];
-  const plan = mine.find(p => p.planId === req.params.id);
-  if (!plan) return res.status(404).json({ error: 'Plan not found' });
-  try {
-    const data = await fs.readFile(plan.summaryFile, 'utf8');
-    res.setHeader('Content-Type', 'application/json');
-    res.send(data);
-  } catch { res.status(404).json({ error: 'Summary file missing' }); }
+  const summary=await getPlanSummary(req.params.id,req.user.email);
+  if(!summary)return res.status(404).json({error:'Plan not found'});
+  res.json(summary);
 });
-
 app.get('/api/testplan/list', authMiddleware, async (req, res) => {
-  const index = await readJson(DB.planIndexFile);
-  const mine = (index[req.user.email] || []).map(p => ({
-    planId: p.planId, project: p.project, epics: p.epics, generatedAt: p.generatedAt
-  }));
-  res.json({ plans: mine.sort((a, b) => (b.generatedAt > a.generatedAt ? 1 : -1)) });
+  const plans=await getPlans(req.user.email);res.json({plans});
 });
 
-// ══════════════════════════════════════════════════════════
-// HEALTH
-// ══════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════
-// SMTP DIAGNOSTIC — GET /api/test/mailgun?to=you@domain.com
-// ══════════════════════════════════════════════════════════
+// SMTP TEST
 app.get('/api/test/mailgun', async (req, res) => {
-  const { host, port, user, pass, from } = CONFIG.smtp;
-  const checks = {
-    SMTP_HOST: `smtp.mailgun.org (hardcoded)`,
-    SMTP_PORT: `587 (hardcoded)`,
-    SMTP_USER: user ? `✓ set (${user})` : '✗ NOT SET',
-    SMTP_PASS: pass ? `✓ set (${pass.slice(0,6)}…)` : '✗ NOT SET',
-    SMTP_FROM: from ? `✓ ${from}` : '✗ NOT SET',
-    FRONTEND_URL: CONFIG.frontendUrl,
-  };
-
-  if (!req.query.to) {
-    return res.json({ status: 'config_check', checks, usage: 'Add ?to=your@email.com to send a test email' });
-  }
-
-  try {
-    const transporter = createTransporter();
-    // Verify connection first
-    await transporter.verify();
-    // Send test email
-    const info = await transporter.sendMail({
-      from,
-      to:      req.query.to,
-      subject: 'Qubit — SMTP test email',
-      text:    'If you receive this, Mailgun SMTP is configured correctly.',
-      html:    '<p style="font-family:sans-serif;font-size:15px">If you receive this, <strong style="color:#7c3aed">Mailgun SMTP is working correctly ✓</strong></p>',
-    });
-    res.json({ status: 'sent', messageId: info.messageId, to: req.query.to, checks });
-  } catch (err) {
-    res.status(500).json({
-      status: 'failed',
-      error:  err.message,
-      checks,
-      fix: err.message.includes('535') || err.message.includes('auth') || err.message.includes('535')
-        ? 'Authentication failed — check SMTP_USER and SMTP_PASS in Render env vars'
-        : err.message.includes('connect') || err.message.includes('ECONNREFUSED')
-        ? 'Cannot connect to smtp.mailgun.org — check network/firewall'
-        : 'Check SMTP_USER, SMTP_PASS, SMTP_FROM in Render environment variables',
-    });
-  }
+  const {host,port,user,pass,from}=CONFIG.smtp;
+  const checks={SMTP_HOST:`smtp.mailgun.org`,SMTP_USER:user?`✓ set (${user})`:'✗ NOT SET',SMTP_PASS:pass?`✓ set (${pass.slice(0,6)}…)`:'✗ NOT SET',SMTP_FROM:from?`✓ ${from}`:'✗ NOT SET',FRONTEND_URL:CONFIG.frontendUrl};
+  if(!req.query.to)return res.json({status:'config_check',checks,usage:'Add ?to=your@email.com'});
+  try{const t=createTransporter();await t.verify();const i=await t.sendMail({from,to:req.query.to,subject:'Qubit SMTP test',text:'SMTP working ✓',html:'<p>SMTP working ✓</p>'});res.json({status:'sent',messageId:i.messageId,checks});}
+  catch(err){res.status(500).json({status:'failed',error:err.message,checks});}
 });
 
+// HEALTH
 app.get('/api/health', (_req, res) => {
-  res.json({
-    ok: true, service: 'qubit-server', version: '1.2.0',
-    uptimeSec: Math.round(process.uptime()),
-    config: {
-      allowedDomains: CONFIG.allowedDomains,
-      googleClientId: CONFIG.googleClientId || null,
-      googleSsoEnabled: !!CONFIG.googleClientId,
-      mcpTimeout: CONFIG.mcp.timeout,
-      mcpMaxRetries: CONFIG.mcp.maxRetries,
-      mcpParallelWorkers: CONFIG.mcp.parallelWorkers,
-      jiraApiVersion: '/rest/api/3/search/jql (new endpoint)'
-    }
+  res.json({ok:true,service:'qubit-server',version:'1.3.0',uptimeSec:Math.round(process.uptime()),config:{allowedDomains:CONFIG.allowedDomains,googleClientId:CONFIG.googleClientId||null,database:process.env.DATABASE_URL?'postgresql':'⚠ not set',mcpTimeout:CONFIG.mcp.timeout}});
+});
+
+app.use((err,_req,res,_next)=>{console.error('Unhandled error:',err);res.status(500).json({error:'Internal server error',detail:err.message});});
+
+// Start
+initDB().then(() => {
+  app.listen(CONFIG.port,'0.0.0.0',()=>{
+    console.log('─────────────────────────────────────────────────');
+    console.log(`  Qubit Server v1.3.0  |  port ${CONFIG.port}`);
+    console.log(`  Database  : ${process.env.DATABASE_URL?'PostgreSQL ✓':'⚠ DATABASE_URL not set'}`);
+    console.log(`  Frontend  : ${CONFIG.frontendUrl}`);
+    console.log(`  SMTP      : smtp.mailgun.org:587 — ${CONFIG.smtp.user||'⚠ not configured'}`);
+    console.log('─────────────────────────────────────────────────');
   });
-});
-
-app.use((err, _req, res, _next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error', detail: err.message });
-});
-
-app.listen(CONFIG.port, '0.0.0.0', () => {
-  console.log('─────────────────────────────────────');
-  console.log('  Qubit Server v1.2.0  |  port', CONFIG.port);
-  console.log('  Frontend URL :', CONFIG.frontendUrl);
-  console.log('  SMTP         : smtp.mailgun.org:587 —', CONFIG.smtp.user ? `user: ${CONFIG.smtp.user}` : '⚠ SMTP_USER not set');
-  console.log('  Google SSO   :', CONFIG.googleClientId ? 'enabled' : 'disabled (set GOOGLE_CLIENT_ID)');
-  console.log('  Data dir     :', CONFIG.dataDir);
-  console.log('  Allowed domains:', CONFIG.allowedDomains.join(', '));
-  console.log('─────────────────────────────────────');
-});
+}).catch(err=>{console.error('DB init failed:',err.message);process.exit(1);});
