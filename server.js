@@ -773,31 +773,35 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       epicsMeta.push({id,meta:{key:epic.key,title:epic.fields.summary,description:dt.slice(0,800),assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',engineeringManager:roles.engineeringManager,qaValidator:roles.qaValidator,stakeholders:roles.stakeholders}});
       log(`✓ Epic loaded: ${epicsMeta[epicsMeta.length-1].meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);
     }
-    phase(1,'done',`${epics.length} epics fetched`);phase(2,'active','');
+    phase(1,'done',`${epics.length} epics fetched`);
+    phase(2,'active','');
     const slbe={};let totalStories=0;
     for(const em of epicsMeta){const jql=`parent in (${em.id}) AND issuetype = Story`;const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const issues=sr.issues||[];slbe[em.id]=issues;log(`✓ ${issues.length} stories for ${em.id}`,'ok');totalStories+=issues.length;}
     phase(2,'done',`${totalStories} stories found`);if(totalStories===0)log(`⚠ No stories found.`,'warn');
     phase(3,'active',`0 of ${totalStories}`);const allEpics=[];let done=0;
     for(const em of epicsMeta){const list=slbe[em.id];const details=list.length>0?await fetchStoriesParallel(client,list,log):[];allEpics.push({id:em.id,meta:em.meta,stories:details});done+=list.length;phase(3,'active',`${done} of ${totalStories}`);}
     phase(3,'done',`${totalStories} stories enriched`);
-    phase(4,'active','ready for generation');phase(4,'done','story data ready');
-    phase(5,'active','complete');phase(5,'done','complete');
-    log(`╚═══ JIRA FETCH COMPLETE — Generating test cases on client ═══`,'ok');
-    // Fetch Confluence for each epic
+    // Phase 4: Fetch Confluence test plans for each epic
+    phase(4,'active',`0 of ${epicsMeta.length}`);
     const confluenceByEpic = {};
-    for (const em of epicsMeta) {
+    for(let ci=0;ci<epicsMeta.length;ci++){
+      const em=epicsMeta[ci];
       log(`──── Confluence for ${em.id} ────`);
       const conf = await fetchConfluenceForEpic(client, em.id, log).catch(() => null);
-      if (conf) confluenceByEpic[em.id] = conf;
+      if(conf){confluenceByEpic[em.id]=conf;log(`✓ Confluence: "${conf.title}"`, 'ok');}
+      else{log(`⚠ No Confluence page for ${em.id} — using Jira data only`,'warn');}
+      phase(4,'active',`${ci+1} of ${epicsMeta.length}`);
     }
-
-    // Enrich allEpics with confluence content
+    phase(4,'done',`Confluence fetched for ${Object.keys(confluenceByEpic).length} of ${epicsMeta.length} epics`);
+    // Phase 5: Enrich and send to client for generation
+    phase(5,'active','Preparing enriched data');
     const enrichedEpics = allEpics.map(e => ({
       ...e,
       confluenceTitle: confluenceByEpic[e.id] ? confluenceByEpic[e.id].title : null,
       confluenceContent: confluenceByEpic[e.id] ? confluenceByEpic[e.id].content : null
     }));
-
+    phase(5,'done','Ready');
+    log(`╚═══ JIRA + CONFLUENCE FETCH COMPLETE — Building test cases on client ═══`,'ok');
     send('complete',{projectName,release,epics,prefix,allEpics:enrichedEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl,confluenceByEpic});
   }catch(err){console.error('[tc-gen]',err);try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}}
   finally{clearInterval(hb);try{res.end();}catch(e){}}
