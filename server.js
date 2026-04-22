@@ -783,6 +783,21 @@ app.get('/api/testplan/:id/summary', authMiddleware, async (req, res) => {
   if(!summary)return res.status(404).json({error:'Plan not found'});
   res.json(summary);
 });
+// Fetch most recent test plan that covers ANY of the given epic IDs
+app.get('/api/testplan/by-epics', authMiddleware, async (req, res) => {
+  const epicIds = (req.query.epics || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  if (!epicIds.length) return res.status(400).json({ error: 'epics query param required' });
+  // Find most recent plan that covers at least one of these epics
+  const r = await db(
+    `SELECT plan_id, summary FROM test_plans
+     WHERE email=$1 AND epics::text ~ ANY($2::text[])
+     ORDER BY generated_at DESC LIMIT 1`,
+    [req.user.email.toLowerCase(), epicIds.map(id => `"${id}"`)]
+  ).catch(() => ({ rows: [] }));
+  if (!r.rows[0]) return res.json({ plan: null });
+  res.json({ plan: r.rows[0].summary });
+});
+
 app.get('/api/testplan/list', authMiddleware, async (req, res) => {
   const plans=await getPlans(req.user.email);res.json({plans});
 });
@@ -843,8 +858,36 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       confluenceContent: confluenceByEpic[e.id] ? confluenceByEpic[e.id].content : null
     }));
     phase(5,'done','Ready');
+
+    // Fetch existing test plan for these epics (if any) — gives scenario headings + bullet items
+    // that the AI uses as a blueprint when writing test cases
+    let existingPlanScenarios = null;
+    try {
+      const epicIds = enrichedEpics.map(e => e.id);
+      const planRow = await db(
+        `SELECT summary FROM test_plans WHERE email=$1 AND epics::text ~ ANY($2::text[]) ORDER BY generated_at DESC LIMIT 1`,
+        [req.user.email.toLowerCase(), epicIds.map(id => `"${id}"`)]
+      );
+      if (planRow.rows[0] && planRow.rows[0].summary) {
+        const planSum = planRow.rows[0].summary;
+        // Extract scenario headings + bullet items per story from the saved plan
+        existingPlanScenarios = (planSum.epics || []).flatMap(e =>
+          (e.stories || []).map(s => ({
+            storyKey:  s.storyKey,
+            storyTitle: s.storyTitle,
+            ac:        s.acceptanceCriteria || []
+            // Note: genScenarios runs client-side — we send the raw story data
+            // and let the AI prompt instruct Claude to use test-plan-style grouping
+          }))
+        );
+        log(`✓ Found existing test plan — scenarios will guide test case design`, 'ok');
+      }
+    } catch(planErr) {
+      log(`⚠ Could not fetch existing test plan — proceeding with Jira data only`, 'warn');
+    }
+
     log(`╚═══ JIRA + CONFLUENCE FETCH COMPLETE — Building test cases on client ═══`,'ok');
-    send('complete',{projectName,release,epics,prefix,allEpics:enrichedEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl,confluenceByEpic});
+    send('complete',{projectName,release,epics,prefix,allEpics:enrichedEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl,confluenceByEpic,existingPlanScenarios});
   }catch(err){console.error('[tc-gen]',err);try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}}
   finally{clearInterval(hb);try{res.end();}catch(e){}}
 });
