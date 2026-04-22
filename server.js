@@ -258,6 +258,15 @@ class AtlassianClient {
   async getIssue(k,fields) { return this._req('GET',`/rest/api/3/issue/${k}${fields?'?fields='+fields.join(','):''}`); }
   async getFields() { return this._req('GET','/rest/api/3/field'); }
   async getChangelog(k) { return this._req('GET',`/rest/api/3/issue/${k}/changelog?maxResults=200`); }
+  async searchConfluence(cql) {
+    const body={cql,limit:5,expand:'body.storage'};
+    return this._req('POST','/wiki/api/v2/pages/search',body).catch(()=>
+      this._req('GET','/wiki/rest/api/content/search?cql='+encodeURIComponent(cql)+'&limit=5&expand=body.storage,body.view')
+    );
+  }
+  async getConfluencePage(pageId) {
+    return this._req('GET',`/wiki/rest/api/content/${pageId}?expand=body.storage,body.view`).catch(()=>null);
+  }
   async searchByJql(jql,fields=['summary','status','issuetype'],maxResults=100) {
     const all=[]; let nextPageToken=null,safety=0;
     do { const p={jql,fields,maxResults}; if(nextPageToken)p.nextPageToken=nextPageToken; const r=await this._req('POST','/rest/api/3/search/jql',p); if(Array.isArray(r.issues))all.push(...r.issues); nextPageToken=r.nextPageToken||null; safety++; if(r.isLast===true||!nextPageToken||safety>=10)break; } while(true);
@@ -333,6 +342,44 @@ function extractAcceptanceCriteria(descText) {
   for(const line of lines){if(/^(acceptance criteria|requirements|ac:|scenarios|given|when|then|definition of done)/i.test(line)){inAc=true;continue;}if(inAc){if(/^(#|##|background|notes?|open questions|out of scope|implementation|technical)/i.test(line)){inAc=false;continue;}const m=line.match(/^[•\-\*]\s*(.+)/)||line.match(/^\d+[\.\)]\s*(.+)/);if(m)bullets.push(m[1].trim());}}
   if(bullets.length===0){for(const line of lines){const m=line.match(/^[•\-\*]\s*(.{15,})/);if(m)bullets.push(m[1].trim());if(bullets.length>=12)break;}}
   return bullets.slice(0,15);
+}
+
+
+// ─── Confluence fetch helper ──────────────────────────────────────────────────
+function adfOrHtmlToText(pageData) {
+  if (!pageData) return '';
+  let body = (pageData.body && (pageData.body.storage || pageData.body.view)) || {};
+  let raw = body.value || '';
+  // Strip HTML tags
+  return raw.replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, 4000);
+}
+
+async function fetchConfluenceForEpic(client, epicKey, onLog) {
+  try {
+    // Search by epic key in DEV space
+    const cql = `space = "DEV" AND title ~ "${epicKey}" AND ancestor = "2164326506"`;
+    const results = await client.searchConfluence(cql);
+    const pages = results.results || results.results || [];
+    if (pages.length === 0) {
+      // Fallback: search by text
+      const cql2 = `space = "DEV" AND text ~ "${epicKey}" AND ancestor = "2164326506"`;
+      const r2 = await client.searchConfluence(cql2);
+      const p2 = r2.results || [];
+      if (p2.length === 0) {
+        if (onLog) onLog(`⚠ No Confluence page found for ${epicKey}`, 'warn');
+        return null;
+      }
+      const page = await client.getConfluencePage(p2[0].id);
+      if (onLog) onLog(`✓ Confluence page found: "${p2[0].title}" (via text search)`, 'ok');
+      return { title: p2[0].title, content: adfOrHtmlToText(page) };
+    }
+    const page = await client.getConfluencePage(pages[0].id);
+    if (onLog) onLog(`✓ Confluence page found: "${pages[0].title}"`, 'ok');
+    return { title: pages[0].title, content: adfOrHtmlToText(page) };
+  } catch (e) {
+    if (onLog) onLog(`⚠ Confluence fetch failed for ${epicKey}: ${e.message}`, 'warn');
+    return null;
+  }
 }
 
 async function fetchStoriesParallel(client, stories, onLog) {
@@ -602,7 +649,22 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     phase(4,'active','ready for generation');phase(4,'done','story data ready');
     phase(5,'active','complete');phase(5,'done','complete');
     log(`╚═══ JIRA FETCH COMPLETE — Generating test cases on client ═══`,'ok');
-    send('complete',{projectName,release,epics,prefix,allEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl});
+    // Fetch Confluence for each epic
+    const confluenceByEpic = {};
+    for (const em of epicsMeta) {
+      log(`──── Confluence for ${em.id} ────`);
+      const conf = await fetchConfluenceForEpic(client, em.id, log).catch(() => null);
+      if (conf) confluenceByEpic[em.id] = conf;
+    }
+
+    // Enrich allEpics with confluence content
+    const enrichedEpics = allEpics.map(e => ({
+      ...e,
+      confluenceTitle: confluenceByEpic[e.id] ? confluenceByEpic[e.id].title : null,
+      confluenceContent: confluenceByEpic[e.id] ? confluenceByEpic[e.id].content : null
+    }));
+
+    send('complete',{projectName,release,epics,prefix,allEpics:enrichedEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl,confluenceByEpic});
   }catch(err){console.error('[tc-gen]',err);try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}}
   finally{clearInterval(hb);try{res.end();}catch(e){}}
 });
