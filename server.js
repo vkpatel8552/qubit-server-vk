@@ -804,6 +804,68 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 
 
 // TEST CASE — GENERATE (SSE: fetch Jira data, frontend generates cases)
+
+// Server-side TC prompt builder — same logic as client but runs on Render with real API key
+function buildServerTCPrompt(epicTitle, epicId, storyBlockJson, acList, confBlock) {
+  return `You are a Senior QA Architect at ClearlyRated with 20+ years of experience.
+Write test cases for: **${epicTitle}** (${epicId})
+
+## TWO HARD RULES
+
+### RULE 1: Different user or role = always a separate test case
+Never combine steps for different users, accounts, or roles in the same test case.
+Each test case uses exactly ONE user identity from start to finish.
+
+### RULE 2: Each distinct functional behavior = its own test case
+Even with the same user, split test cases when the functional scenario changes.
+A functional scenario is distinct when it tests a different feature section or needs different test data.
+
+Example — NPS Digest epic correctly produces MULTIPLE test cases:
+- TC: Subscribe flow, drawer defaults, key contact auto-population, State A→B transition (Account Manager)
+- TC: Settings drawer — frequency options, helper text, per-audience status (Account Manager)
+- TC: Settings drawer — save success, unsaved-changes warning, error/retry (Account Manager)
+- TC: Recipient management — search, add, duplicate check, zero-access warning, key contact sync (Account Manager)
+- TC: Flag OFF — all roles cannot see card, DOM check, URL access denied, data persists on toggle (Various roles)
+
+Note: multiple TCs use Account Manager — same user in multiple TCs is CORRECT.
+The split is based on WHAT is being tested, not WHO is testing it.
+
+## ACCEPTANCE CRITERIA — cover all, no repeats
+${acList}
+
+## STEP QUALITY
+Each step = one clear action + one specific observable result.
+- Quote exact copy text, button labels, messages from the ACs
+- Describe states: "green dot", "2 of 2 digests active", "State B", "amber warning"
+- Plain English — someone new to the product understands every step
+- 10–18 steps per test case
+- Never: "Assert:", "API call", "HTTP 403", "DevTools" — plain language only
+- Never vague: "it works", "is visible", "is correct"
+
+## STORIES & ACS
+${storyBlockJson}
+${confBlock}
+
+## PROCESS
+1. Identify distinct functional behaviors from the ACs
+2. Group ACs that test the same behavior together
+3. Split groups that need different users
+4. Write one test case per group (expect 4–8 test cases for a typical epic)
+
+Return ONLY valid JSON array — no markdown, no explanation:
+[
+  {
+    "title": "Validate [feature]: [specific flows covered]",
+    "category": "Positive Flows",
+    "preconditions": "User logged in as [Role]; [specific data state]",
+    "credentials": "[exact role]",
+    "storyIds": ["${epicId}"],
+    "acRefs": ["storyId/AC1"],
+    "steps": [{ "action": "...", "expectedResult": "..." }]
+  }
+]`;
+}
+
 app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const {projectName,release,epics,prefix}=req.body||{};
   if(!projectName||!Array.isArray(epics)||epics.length===0||!prefix)return res.status(400).json({error:'projectName, epics[], and prefix required'});
@@ -896,8 +958,65 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     }
     phase(5,'done','Test plan scenarios loaded');
 
-    log(`╚═══ ALL DATA READY — Sending to client for AI test case generation ═══`,'ok');
-    send('complete',{projectName,release,epics,prefix,allEpics:enrichedEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl,confluenceByEpic,existingPlanScenarios});
+    // Phase 6: AI test case generation (server-side — needs API key)
+    phase(5,'active','Generating test cases with AI...');
+    log(`╔═══ GENERATING TEST CASES VIA CLAUDE AI ═══`,'ok');
+    let generatedCases = [];
+    const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+    if (!ANTHROPIC_KEY) {
+      log(`⚠ ANTHROPIC_API_KEY not set — skipping AI generation, client will fallback`,'warn');
+    } else {
+      for (const epic of enrichedEpics) {
+        const stories = epic.stories || [];
+        if (!stories.length) continue;
+        log(`  Generating TCs for epic: ${epic.meta?.title || epic.id}`,'ok');
+        // Build AC inventory
+        const acInventory = [];
+        stories.forEach((s,si) => {
+          (s.ac||[]).forEach((ac,ai) => {
+            acInventory.push({ ref: `${s.id}/AC${ai+1}`, story: s.id, title: s.title||'', ac });
+          });
+        });
+        const acList = acInventory.map((a,i) => `${i+1}. [${a.ref}] ${a.ac}`).join('\n');
+        const storyBlock = JSON.stringify(stories.map(s => ({
+          id: s.id, title: s.title||'', desc: (s.desc||'').slice(0,300), ac: (s.ac||[]).slice(0,30)
+        })), null, 2);
+        const confBlock = epic.confluenceContent ? `\n\nConfluence notes:\n${epic.confluenceContent.slice(0,1500)}` : '';
+        const prompt = buildServerTCPrompt(epic.meta?.title || epic.id, epic.id, storyBlock, acList, confBlock);
+        try {
+          const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 16000, messages: [{ role: 'user', content: prompt }] })
+          });
+          const aiData = await aiResp.json();
+          if (!aiResp.ok) throw new Error(aiData.error?.message || `API ${aiResp.status}`);
+          let raw = (aiData.content?.[0]?.text || '').replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+          const parsed = JSON.parse(raw);
+          const cases = Array.isArray(parsed) ? parsed : (parsed.testCases || parsed.cases || []);
+          if (!cases.length) throw new Error('0 cases returned');
+          let caseNum = (generatedCases.length || 0) + 1;
+          cases.forEach(tc => {
+            generatedCases.push({
+              caseId:        `${prefix}-${String(caseNum++).padStart(3,'0')}`,
+              title:         (tc.title||`Validate ${epic.meta?.title||epic.id}`).trim(),
+              category:      tc.category || 'Positive Flows',
+              preconditions: (tc.preconditions||'').replace(/\n+/g,' ').trim(),
+              credentials:   tc.credentials || 'Account Manager',
+              stories:       tc.storyIds || stories.map(s => s.id),
+              acRefs:        tc.acRefs || [],
+              steps:         (tc.steps||[]).map((s,i) => ({ stepNum: i+1, action: (s.action||'').trim(), expectedResult: (s.expectedResult||s.expected||'').trim() }))
+            });
+          });
+          log(`  ✓ ${cases.length} test case(s) for ${epic.meta?.title||epic.id}`,'ok');
+        } catch(aiErr) {
+          log(`  ✗ AI generation failed for ${epic.id}: ${aiErr.message} — client will use fallback`,'warn');
+        }
+      }
+    }
+    phase(5,'done',`${generatedCases.length} test cases generated`);
+    log(`╚═══ GENERATION COMPLETE — sending to client ═══`,'ok');
+    send('complete',{projectName,release,epics,prefix,allEpics:enrichedEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl,confluenceByEpic,existingPlanScenarios,generatedCases});
   }catch(err){console.error('[tc-gen]',err);try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}}
   finally{clearInterval(hb);try{res.end();}catch(e){}}
 });
@@ -910,6 +1029,42 @@ app.post('/api/testcase/save', authMiddleware, async (req, res) => {
     await recordStatEvent(req.user.email,'testCases');
     res.json({ok:true,tcId});
   }catch(err){res.status(500).json({error:err.message});}
+});
+
+// AI test case generation endpoint — calls Anthropic API server-side with API key
+app.post('/api/testcase/ai', authMiddleware, async (req, res) => {
+  const { prompt } = req.body || {};
+  if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+
+  try {
+    const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
+      method:  'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 16000,
+        messages:   [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (!aiResp.ok) {
+      const err = await aiResp.text();
+      return res.status(aiResp.status).json({ error: 'Anthropic API error: ' + err.slice(0, 200) });
+    }
+
+    const data = await aiResp.json();
+    const raw  = (data.content && data.content[0] && data.content[0].text) || '';
+    res.json({ text: raw });
+  } catch (err) {
+    res.status(500).json({ error: 'AI generation failed: ' + err.message });
+  }
 });
 
 app.get('/api/testcase/list', authMiddleware, async (req, res) => {
