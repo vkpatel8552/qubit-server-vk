@@ -78,13 +78,14 @@ const CONFIG = {
   }
 };
 
-// PostgreSQL Pool
+// PostgreSQL Pool — Neon free tier cold-starts can take 10–15s
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
+  max: 5,
+  idleTimeoutMillis:      30000,
+  connectionTimeoutMillis: 20000,  // Neon cold-start needs up to 15s
+  allowExitOnIdle:         false,
 });
 
 async function db(sql, params = []) {
@@ -118,6 +119,24 @@ async function initDB() {
   )`);
   await db(`CREATE INDEX IF NOT EXISTS idx_test_cases_email ON test_cases(email)`);
   console.log('[db] Tables ready');
+}
+
+// Retry DB init up to 5 times — handles Neon cold-start delays gracefully
+async function initDBWithRetry(attempts = 5, delayMs = 5000) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await initDB();
+      return; // success
+    } catch (err) {
+      console.error(`[db] Init attempt ${i}/${attempts} failed: ${err.message}`);
+      if (i < attempts) {
+        console.log(`[db] Retrying in ${delayMs/1000}s...`);
+        await new Promise(r => setTimeout(r, delayMs));
+      } else {
+        throw err; // all attempts exhausted
+      }
+    }
+  }
 }
 
 // DB helpers
@@ -1219,7 +1238,7 @@ app.get('/api/health', (_req, res) => {
 app.use((err,_req,res,_next)=>{console.error('Unhandled error:',err);res.status(500).json({error:'Internal server error',detail:err.message});});
 
 // Start
-initDB().then(() => {
+initDBWithRetry(5, 6000).then(() => {
   app.listen(CONFIG.port,'0.0.0.0',()=>{
     console.log('─────────────────────────────────────────────────');
     console.log(`  Qubit Server v1.3.0  |  port ${CONFIG.port}`);
@@ -1228,4 +1247,8 @@ initDB().then(() => {
     console.log(`  SMTP      : smtp.mailgun.org:587 — ${CONFIG.smtp.user||'⚠ not configured'}`);
     console.log('─────────────────────────────────────────────────');
   });
-}).catch(err=>{console.error('DB init failed:',err.message);process.exit(1);});
+}).catch(err=>{
+  console.error('DB init failed after all retries:',err.message);
+  console.error('Check DATABASE_URL env var and Neon dashboard — server cannot start without DB.');
+  process.exit(1);
+});
