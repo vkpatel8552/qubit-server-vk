@@ -1037,21 +1037,20 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 
 
 
-// Build a structured summary document from story data + Confluence test plan
-// — mirrors exactly how the clearlyrated-test-case-creation skill works
+
 function buildStorySummary(stories) {
   return stories.map((s, i) => {
     const reqs = (s.ac||[]);
     const reqText = reqs.length > 0
       ? reqs.map((r, ri) => `  ${ri+1}. ${r}`).join('\n')
-      : '  (no structured requirements — derive from full description above)';
+      : '  (derive all test scenarios from the full description below)';
     return [
       `## Story ${i+1}: ${s.id} — ${s.title}`,
-      '',
-      '### Full Description',
+      ``,
+      `### Description`,
       s.desc || '(no description)',
-      '',
-      `### Requirements (${reqs.length} extracted)`,
+      ``,
+      `### Requirements (${reqs.length})`,
       reqText
     ].join('\n');
   }).join('\n\n---\n\n');
@@ -1061,75 +1060,171 @@ function buildServerTCPrompt(epicTitle, epicId, stories, confluenceContent, conf
   const storySummary = buildStorySummary(stories);
   const confSection  = confluenceContent
     ? `\n\n---\n\n## Confluence Test Plan: "${confluenceTitle}"\n\n${confluenceContent.slice(0, 2000)}`
-    : '\n\n---\n\n## Confluence Test Plan\n\n(Not found — generating from Jira data only)';
+    : '\n\n---\n\n## Confluence Test Plan: Not found — use Jira data only';
 
-  return `You are a Senior QA Architect with 20+ years in Enterprise SaaS generating automation-ready test cases.
+  return `You are a Senior QA Architect at ClearlyRated with 20+ years of experience.
+Generate test cases for: ${epicTitle} (${epicId})
 
-Epic: ${epicTitle} (${epicId})
+Read every word of every story description. Your test cases must be as specific and detailed as the examples below.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EPIC SUMMARY DOCUMENT
+PART 1: REFERENCE EXAMPLES — MATCH THIS QUALITY EXACTLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These are real test cases from this codebase. Study the title format, step writing style, and expected result format.
+
+EXAMPLE 1:
+Title: "Validate Feature Flag activation, auto-enrollment of accounts and recipients, and NEW badge lifecycle"
+Preconditions: "Firm A with flag OFF; Firm B with flag ON; Account B1 (Firm B) has 2 key contacts; no digest sent yet; User C (Firm B) has never opened Settings drawer"
+Credentials: "CR Employee, Firm B"
+Steps:
+  1. Action: "Navigate to Insights > Overview page for Account B1 (Firm B, flag ON)"
+     Expected: "Performance Digest card appears below NPS Score card"
+  2. Action: "Verify card displays State A: NEW badge, title, sub-text, Subscribe button"
+     Expected: "All elements render correctly; card is NOT in Reporting Center"
+  3. Action: "Verify key contact auto-population: open Settings drawer via Subscribe button"
+     Expected: "Settings drawer opens; both key contacts pre-populated with 'Key Contact' labels and project access summary"
+  4. Action: "Close drawer without saving and reopen from card"
+     Expected: "Drawer reopens; both key contacts still present; no changes lost"
+  5. Action: "Sign out and sign back in as different user (User D, Firm B) who has never opened drawer"
+     Expected: "NEW badge visible for User D (tracked per user, not per firm)"
+  6. Action: "User D opens Settings drawer for the first time"
+     Expected: "Drawer opens; NEW badge disappears immediately on card"
+  7. Action: "Return to User C; verify NEW badge still visible (independent state per user)"
+     Expected: "User C badge unaffected by User D's action"
+  8. Action: "Turn flag OFF for Firm B and verify card disappears"
+     Expected: "Card completely hidden for all Firm B users; no UI element present"
+  9. Action: "Turn flag back ON and verify settings are restored from before"
+     Expected: "Card reappears; frequency, recipients, and configuration preserved"
+
+EXAMPLE 2:
+Title: "Validate Settings Drawer frequency configuration, per-audience status summary, and save/error/unsaved-changes behavior"
+Preconditions: "Drawer open; Account with Client (active), Talent (suppressed - <5 responses), Employee (no projects); Monthly frequency set"
+Credentials: "Account Manager"
+Steps:
+  1. Action: "Open Settings drawer and locate frequency selector"
+     Expected: "Selector shows three options: Weekly, Monthly, Quarterly; Monthly currently selected"
+  2. Action: "Verify helper text below Monthly selection reads correctly"
+     Expected: "Text: 'Sends on the 3rd working day of each month at 9:30 AM PST. Covers all surveys with a start date in the prior calendar month.'"
+  3. Action: "Click on Weekly option in frequency selector"
+     Expected: "Weekly becomes selected; helper text updates immediately to Weekly text without page refresh"
+  4. Action: "Locate per-audience-type status summary at bottom of drawer"
+     Expected: "Summary shows at least three sections: Client (green dot), Talent (red dot), Employee (red dot)"
+  5. Action: "Verify Talent status: red dot with 'Not enough responses received in [period]. Not sent.'"
+     Expected: "Red dot and exact copy match; distinct from other suppression reasons"
+  6. Action: "Attempt to close drawer via X button without saving"
+     Expected: "Warning modal: 'You have unsaved changes. Save before closing?' with Save/Discard buttons"
+  7. Action: "Click Discard button in warning"
+     Expected: "Drawer closes; changes are reverted; next drawer open shows original settings"
+  8. Action: "Click Save Settings button after making a change"
+     Expected: "Loading indicator appears on button; 'Settings saved.' notification displays"
+  9. Action: "Simulate save error: verify error notification"
+     Expected: "Error notification: 'Something went wrong. Please try again.' Error persists; user can retry"
+
+EXAMPLE 3:
+Title: "Validate Suppression Engine: all five conditions, independent audience-type behavior, AI retry up to 24 hours, and cadence change handling"
+Preconditions: "Five test account scenarios, each triggering one suppression condition; flag ON; Monthly cadence for all"
+Credentials: "Backend test harness, AM role"
+Steps:
+  1. Action: "Test Condition 1 (zero surveys): Account A has no surveys with start date in current period"
+     Expected: "Digest suppressed silently; no email sent"
+  2. Action: "Verify Condition 1 drawer status: open Settings drawer, check Client status shows red dot and text 'No surveys in this period. Not sent.'"
+     Expected: "Drawer status correctly reflects suppression reason"
+  3. Action: "Test Condition 2 (<5 responses): Account B has 3 responses for surveys in current period"
+     Expected: "Digest suppressed silently"
+  4. Action: "Verify Condition 2 drawer status: red dot with text 'Not enough responses received in [period]. Not sent.'"
+     Expected: "Drawer shows correct copy; distinct from Condition 1"
+  5. Action: "Test Condition 5 (AI failure): Account E has 5+ responses but AI Insights generation fails"
+     Expected: "Initial send attempt triggers AI retry window"
+  6. Action: "Verify AI retry runs up to 24 hours from original scheduled send time"
+     Expected: "Retries continue; no send occurs until AI succeeds or window closes"
+  7. Action: "Test audience type independence: Account F has Client (5+ responses) and Talent (<5 responses)"
+     Expected: "Client digest sends; Talent digest suppressed independently"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2: STRICT TITLE RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The title MUST describe the complete test scenario in human-readable terms.
+
+✅ GOOD titles:
+- "Validate Feature Flag activation, auto-enrollment of accounts and recipients, and NEW badge lifecycle"
+- "Validate Settings Drawer frequency configuration, per-audience status summary, and save/error/unsaved-changes behavior"
+- "Validate Recipient Management: key contact auto-sync, add/validate/duplicate/no-access flows end-to-end"
+- "Validate Email Subject Line signal priority Ranks 1–5, audience type enforcement, no-negative-framing rule, and first-digest edge case"
+- "Validate Analytics Logging: email opened, CTA clicked, and feedback submitted events with correct aggregation and no client-facing exposure"
+- "Validate role-based visibility and access control for Performance Digest card and Settings Drawer"
+
+❌ BAD titles (NEVER do these):
+- "Validate Default state: OFF. Pending confirmation..." — this is raw Jira text, not a title
+- "Validate Example: Bill Kane has access to 3 Client..." — quoting examples from the description, not describing the test
+- "Validate Visible to: CR Employee..." — incomplete fragment
+- "Validate ENG-2942 requirements" — never use story IDs in titles
+- "Validate feature works correctly" — too vague
+
+Title formula: "Validate [Feature/Component]: [behavior1], [behavior2], and [behavior3]"
+OR: "Validate [complete scenario description that tells the reader exactly what is being tested]"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3: STEP WRITING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ACTIONS: Short, specific, one action each. Real UI element names and exact copy from the description.
+  ✅ "Navigate to Insights > Overview and locate Performance Digest card in left column"
+  ✅ "Click 'Subscribe' button on the Performance Digest card"
+  ✅ "Test Condition 2 (<5 responses): Account B has 3 responses for surveys in current period"
+  ✅ "Verify Talent status: red dot with 'Not enough responses received in [period]. Not sent.'"
+  ✅ "Log out and log in as Admin at Firm C; navigate to Insights > Overview"
+  ❌ "Check that the feature works" — too vague
+  ❌ "Assert the API returns 200" — technical jargon
+  ❌ "Verify via DevTools" — not UI-level
+
+EXPECTED RESULTS: Specific, observable, with exact quoted copy where available.
+  ✅ "Settings drawer opens; both key contacts pre-populated with 'Key Contact' labels and project access summary"
+  ✅ "Text: 'Sends on the 3rd working day of each month at 9:30 AM PST.'"
+  ✅ "Warning modal: 'You have unsaved changes. Save before closing?' with Save/Discard buttons"
+  ✅ "Digest suppressed silently; no email sent"
+  ❌ "It works correctly" — meaningless
+  ❌ "The element is visible" — not specific
+
+STEP COUNT: 12–18 per test case. Up to 20 for multi-condition scenarios.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4: GROUPING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Group by what the test case covers — not by story:
+- Same screen + same user + same flow = one test case
+- Different user role or different account = separate test case  
+- Multi-condition test (5 suppression states, 5 subject line ranks) = ONE test case with "Account A:", "Condition 1:", "Recipient A:" prefixes
+- Never create one test case per requirement bullet
+
+Expected: 4–10 test cases for a typical epic.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 5: EPIC DATA — read every word
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ${storySummary}
 ${confSection}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TEST CASE DESIGN RULES (NON-NEGOTIABLE)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-RULE 1 — 100% COVERAGE
-Every requirement from every story must be traceable to at least one test step.
-Read EVERY story's full description + requirements. Nothing is skipped.
-
-RULE 2 — ONE STEP = ONE ACTION + ONE OBSERVABLE RESULT
-Every step: one specific action the tester performs + one deterministic, observable result.
-Expected results quote exact UI copy, states, counts, colors from the story descriptions.
-Never vague: "verify it works", "check it loads", "confirm element is visible".
-Never technical: "Assert:", "API call", "HTTP", "DevTools", "DOM element".
-
-RULE 3 — NO REDUNDANT TEST CASES
-Combine logically aligned scenarios from same or related stories into single end-to-end test cases.
-Stories that share the same screen and same user flow → ONE test case.
-Never one test case per AC bullet. Never one test case per story.
-
-RULE 4 — SPLIT BY USER IDENTITY
-Each test case uses exactly one logged-in user from start to finish.
-Different role, different firm, or different account state → separate test case.
-Same user can appear in multiple test cases (fine for automation).
-
-RULE 5 — STEP COUNT
-12–18 steps per test case. Up to 20 for multi-condition scenarios (e.g. testing 5 suppression conditions).
-If a scenario exceeds 20 steps, split at a natural save/close boundary.
-
-RULE 6 — TITLE FROM BEHAVIORS, NOT STORY NAMES
-"Validate [Feature]: [behavior1], [behavior2], and [behavior3]"
-Derived from what is being tested — never from story titles, IDs, or Jira keys.
-
-RULE 7 — NAVIGATION IN EVERY FIRST STEP
-First step always: Navigate to [exact page/section name from description].
-NOT "Log in as..." — preconditions handle the login state.
-
-RULE 8 — MULTI-CONDITION TESTS
-For scenarios testing N conditions (5 suppression states, 5 subject line ranks, etc.):
-Use "Account A:", "Account B:", "Test Condition 1:" step prefixes.
-Keep all conditions in ONE test case — do not split.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT — return ONLY valid JSON, no explanation
+OUTPUT — return ONLY valid JSON array, nothing else
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [
   {
-    "title": "Validate [Feature]: [behaviors covered]",
+    "title": "Validate [complete scenario description — see good examples above]",
     "category": "Positive Flows",
-    "preconditions": "[exact data and account state; semicolons between conditions]",
-    "credentials": "[exact role — Account Manager / Admin / CR Employee / Various roles]",
+    "preconditions": "Specific data state; account state; user state — separated by semicolons",
+    "credentials": "Exact role (Account Manager / Admin / CR Employee / Various roles / Backend test harness)",
     "storyIds": ["${epicId}"],
     "acRefs": [],
     "steps": [
-      { "action": "Navigate to [exact page].", "expectedResult": "[what appears on screen — specific text, states, counts]" },
-      { "action": "Verify [specific behavior].", "expectedResult": "[exact quoted copy, colors, states, labels]" }
+      {
+        "action": "Navigate to [exact page] and [specific action].",
+        "expectedResult": "[Exact observable result with quoted copy from the description where available]"
+      }
     ]
   }
 ]`;
