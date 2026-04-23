@@ -944,7 +944,13 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     phase(1,'active',`0 of ${epics.length}`);const epicsMeta=[];
     for(let i=0;i<epics.length;i++){
       const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);
-      const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority']),CONFIG.mcp.maxRetries,log);
+      const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority','issuetype']),CONFIG.mcp.maxRetries,log);
+      const epicType = epic.fields.issuetype?.name || '';
+      if (!['Epic','epic'].includes(epicType) && epicType !== '') {
+        log(`✗ ${id} is a "${epicType}", not an Epic — stopping.`,'err');
+        send('error',{error:`${id} is a "${epicType}", not an Epic. Only Epic-type issues are supported for test plan generation. Please enter a valid Epic ID (e.g. ENG-2941).`});
+        return;
+      }
       const dt=adfToPlainText(epic.fields.description);
       // Enrich roles from Jira fields + changelog
       const roles = await extractEpicRoles(client, id, epic.fields, fieldMap);
@@ -1030,76 +1036,100 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 
 
 
-function buildServerTCPrompt(epicTitle, epicId, storyBlock, confBlock) {
-  return `You are a Senior QA Architect generating test cases for ClearlyRated.
+
+// Build a structured summary document from story data + Confluence test plan
+// — mirrors exactly how the clearlyrated-test-case-creation skill works
+function buildStorySummary(stories) {
+  return stories.map((s, i) => {
+    const reqs = (s.ac||[]);
+    const reqText = reqs.length > 0
+      ? reqs.map((r, ri) => `  ${ri+1}. ${r}`).join('\n')
+      : '  (no structured requirements — derive from full description above)';
+    return [
+      `## Story ${i+1}: ${s.id} — ${s.title}`,
+      '',
+      '### Full Description',
+      s.desc || '(no description)',
+      '',
+      `### Requirements (${reqs.length} extracted)`,
+      reqText
+    ].join('\n');
+  }).join('\n\n---\n\n');
+}
+
+function buildServerTCPrompt(epicTitle, epicId, stories, confluenceContent, confluenceTitle) {
+  const storySummary = buildStorySummary(stories);
+  const confSection  = confluenceContent
+    ? `\n\n---\n\n## Confluence Test Plan: "${confluenceTitle}"\n\n${confluenceContent.slice(0, 2000)}`
+    : '\n\n---\n\n## Confluence Test Plan\n\n(Not found — generating from Jira data only)';
+
+  return `You are a Senior QA Architect with 20+ years in Enterprise SaaS generating automation-ready test cases.
 
 Epic: ${epicTitle} (${epicId})
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STORY DETAILS — read every word of every story
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EPIC SUMMARY DOCUMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Each story has:
-- Full Description: the complete story content as written in Jira (background, requirements, behaviors, edge cases, tables, QA notes — everything)
-- Extracted Requirements: key requirements auto-identified from the description
+${storySummary}
+${confSection}
 
-Read BOTH sections for every story. The Full Description is the primary source. The Extracted Requirements are a quick reference — they may be incomplete.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TEST CASE DESIGN RULES (NON-NEGOTIABLE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-${storyBlock}
-${confBlock}
+RULE 1 — 100% COVERAGE
+Every requirement from every story must be traceable to at least one test step.
+Read EVERY story's full description + requirements. Nothing is skipped.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HOW TO GROUP INTO TEST CASES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 2 — ONE STEP = ONE ACTION + ONE OBSERVABLE RESULT
+Every step: one specific action the tester performs + one deterministic, observable result.
+Expected results quote exact UI copy, states, counts, colors from the story descriptions.
+Never vague: "verify it works", "check it loads", "confirm element is visible".
+Never technical: "Assert:", "API call", "HTTP", "DevTools", "DOM element".
 
-After reading all stories, group requirements into test cases by functional behavior:
+RULE 3 — NO REDUNDANT TEST CASES
+Combine logically aligned scenarios from same or related stories into single end-to-end test cases.
+Stories that share the same screen and same user flow → ONE test case.
+Never one test case per AC bullet. Never one test case per story.
 
-SAME test case when:
-- Requirements test the same feature behavior in the same user flow
-- Same user account and same screen — steps follow naturally from each other
-- Example: card display + clicking Subscribe + drawer defaults + key contacts + save = ONE test case
+RULE 4 — SPLIT BY USER IDENTITY
+Each test case uses exactly one logged-in user from start to finish.
+Different role, different firm, or different account state → separate test case.
+Same user can appear in multiple test cases (fine for automation).
 
-NEW test case when:
-- Different user account or role is needed (different user = different automation script)
-- Genuinely different feature area (flag control vs email content vs analytics logging)
-- A test condition needs completely different setup (Account A with X, Account B with Y)
+RULE 5 — STEP COUNT
+12–18 steps per test case. Up to 20 for multi-condition scenarios (e.g. testing 5 suppression conditions).
+If a scenario exceeds 20 steps, split at a natural save/close boundary.
 
-Expected: 4–8 test cases per epic.
+RULE 6 — TITLE FROM BEHAVIORS, NOT STORY NAMES
+"Validate [Feature]: [behavior1], [behavior2], and [behavior3]"
+Derived from what is being tested — never from story titles, IDs, or Jira keys.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HOW TO WRITE STEPS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 7 — NAVIGATION IN EVERY FIRST STEP
+First step always: Navigate to [exact page/section name from description].
+NOT "Log in as..." — preconditions handle the login state.
 
-TITLE: "Validate [what is being tested from the requirements]: [key behaviors]"
-- Derived from the requirements you cover — never from story titles or IDs
+RULE 8 — MULTI-CONDITION TESTS
+For scenarios testing N conditions (5 suppression states, 5 subject line ranks, etc.):
+Use "Account A:", "Account B:", "Test Condition 1:" step prefixes.
+Keep all conditions in ONE test case — do not split.
 
-PRECONDITIONS: One sentence with semicolons — the exact data state before step 1
-- "Firm A with flag OFF; Firm B with flag ON; Account B1 has 2 key contacts assigned"
-
-STEPS (12–18 per test case):
-- Start directly at the feature: "Navigate to Insights > Overview for Account B1"
-- "Verify" starts most steps — it is the dominant pattern in QA at ClearlyRated
-- Use exact UI copy, button names, and values from the story descriptions
-- For role tests: "Log out and log in as [Role]; navigate to [page]"
-- For multi-condition tests: "Account A (flag ON): [verify]" / "Account B (flag OFF): [verify]"
-- Expected results: specific, observable — counts, states, colors, exact text
-- Never: "Assert:", "API call", "HTTP", "DevTools", "DOM", or vague phrases like "it works"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT — return ONLY valid JSON, no other text
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT — return ONLY valid JSON, no explanation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [
   {
-    "title": "Validate [specific behaviors from requirements]",
+    "title": "Validate [Feature]: [behaviors covered]",
     "category": "Positive Flows",
-    "preconditions": "[exact data state]",
-    "credentials": "[exact role]",
+    "preconditions": "[exact data and account state; semicolons between conditions]",
+    "credentials": "[exact role — Account Manager / Admin / CR Employee / Various roles]",
     "storyIds": ["${epicId}"],
     "acRefs": [],
     "steps": [
-      { "action": "Navigate to [exact page/section].", "expectedResult": "[specific state on screen]" },
-      { "action": "Verify [specific behavior].", "expectedResult": "[exact observable result with quoted copy]" }
+      { "action": "Navigate to [exact page].", "expectedResult": "[what appears on screen — specific text, states, counts]" },
+      { "action": "Verify [specific behavior].", "expectedResult": "[exact quoted copy, colors, states, labels]" }
     ]
   }
 ]`;
@@ -1148,9 +1178,15 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     for(let i=0;i<epics.length;i++){
       const id=epics[i];
       log(`Fetching epic ${i+1}/${epics.length}: ${id}`);
-      const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status']),CONFIG.mcp.maxRetries,log);
+      const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','issuetype']),CONFIG.mcp.maxRetries,log);
+      const issueType = epic.fields.issuetype?.name || '';
+      if (!['Epic','epic'].includes(issueType) && issueType !== '') {
+        log(`✗ ${id} is a "${issueType}", not an Epic. Please enter Epic IDs only (e.g. ENG-2941).`,'err');
+        send('error',{error:`${id} is a "${issueType}", not an Epic. Only Epic-type issues are supported. Check the Jira issue type and try again.`});
+        return;
+      }
       epicsMeta.push({id, title: epic.fields.summary});
-      log(`✓ ${id}: ${epic.fields.summary}`,'ok');
+      log(`✓ ${id}: ${epic.fields.summary} [${issueType||'Epic'}]`,'ok');
       phase(1,'active',`${i+1} of ${epics.length}`);
     }
     phase(1,'done',`${epics.length} epic(s) loaded`);
@@ -1220,35 +1256,20 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
         log(`  Requirements extracted: ${totalReqs} across ${stories.length} stories`,'ok');
         stories.forEach(s => log(`    ${s.id}: ${s.ac.length} reqs — ${s.title.slice(0,50)}`,'ok'));
 
-        // Build the story block sent to Claude
-        const storyBlock = stories.map((s,i) => {
-          const reqText = s.ac.length > 0
-            ? s.ac.map((r,ri) => `  ${ri+1}. ${r}`).join('\n')
-            : '  (read full description below — no structured requirements found)';
-          return [
-            `STORY ${i+1}: ${s.id} — ${s.title}`,
-            ``,
-            `Full Description:`,
-            (s.desc||'(no description)').slice(0, 2000),
-            ``,
-            `Requirements:`,
-            reqText
-          ].join('\n');
-        }).join('\n\n' + '─'.repeat(50) + '\n\n');
+        // Build prompt: stories summary doc + Confluence test plan (same approach as skill)
+        const confData    = confluenceByEpic[epic.id] || null;
+        const confContent = confData ? confData.content : null;
+        const confTitle   = confData ? confData.title   : null;
 
-        const confNote = confluenceByEpic[epic.id]
-          ? `\n\nConfluence Notes (${confluenceByEpic[epic.id].title}):\n${confluenceByEpic[epic.id].content.slice(0,1500)}`
-          : '';
-
-        const prompt = buildServerTCPrompt(epic.title||epic.id, epic.id, storyBlock, confNote);
-        log(`  Sending to Claude (${prompt.length} chars)...`,'info');
+        const prompt = buildServerTCPrompt(epic.title||epic.id, epic.id, stories, confContent, confTitle);
+        log(`  Prompt size: ${prompt.length} chars | stories: ${stories.length} | conf: ${confData?'yes':'no'}`,'info');
 
         try {
           const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
             method:'POST',
             headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
             body: JSON.stringify({
-              model:      'claude-sonnet-4-5-20251001',
+              model:      'claude-sonnet-4-6',
               max_tokens: 16000,
               system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no text before or after the JSON. Start your response with [ and end with ].',
               messages:   [{role:'user', content: prompt}]
@@ -1343,7 +1364,7 @@ app.post('/api/testcase/ai', authMiddleware, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-5-20251001',
+        model:      'claude-sonnet-4-6',
         max_tokens: 16000,
         messages:   [{ role: 'user', content: prompt }]
       })
