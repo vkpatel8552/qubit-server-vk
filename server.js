@@ -1229,7 +1229,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
             `STORY ${i+1}: ${s.id} — ${s.title}`,
             ``,
             `Full Description:`,
-            s.desc || '(no description)',
+            (s.desc||'(no description)').slice(0, 2000),
             ``,
             `Requirements:`,
             reqText
@@ -1248,27 +1248,28 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
             method:'POST',
             headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
             body: JSON.stringify({
-              model: 'claude-3-5-sonnet-20241022',
+              model:      'claude-sonnet-4-5-20251001',
               max_tokens: 16000,
-              messages: [{role:'user', content: prompt}]
+              system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no text before or after the JSON. Start your response with [ and end with ].',
+              messages:   [{role:'user', content: prompt}]
             })
           });
 
           const aiData = await aiResp.json();
-          if(!aiResp.ok) throw new Error(`Anthropic API error ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
+          if(!aiResp.ok) throw new Error(`Anthropic API ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
 
           const rawText = (aiData.content?.[0]?.text || '').trim();
-          log(`  Claude responded: ${rawText.length} chars`,'ok');
+          log(`  Claude response: ${rawText.length} chars, usage: ${aiData.usage?.input_tokens||'?'} in / ${aiData.usage?.output_tokens||'?'} out`,'ok');
 
-          // Robust JSON extraction — find first [ to last ]
-          const jsonStart = rawText.indexOf('[');
-          const jsonEnd   = rawText.lastIndexOf(']');
-          if(jsonStart === -1 || jsonEnd === -1) throw new Error(`No JSON array in response. Preview: ${rawText.slice(0,200)}`);
+          // Robust JSON extraction: find first [{  to last }]
+          const jsonStart = rawText.search(/\[\s*\{/);
+          const jsonEnd   = rawText.lastIndexOf('}]');
+          if(jsonStart === -1 || jsonEnd === -1) throw new Error(`No JSON array found. Response preview: ${rawText.slice(0,300)}`);
 
-          const jsonStr = rawText.slice(jsonStart, jsonEnd+1);
-          const parsed  = JSON.parse(jsonStr);
-          const cases   = Array.isArray(parsed) ? parsed : [];
-          if(!cases.length) throw new Error(`Claude returned empty array. Raw: ${rawText.slice(0,200)}`);
+          const jsonStr = rawText.slice(jsonStart, jsonEnd + 2); // +2 to include '}]'
+          const cases   = JSON.parse(jsonStr);
+          if(!Array.isArray(cases) || !cases.length) throw new Error(`Empty array returned. Raw: ${rawText.slice(0,200)}`);
+
 
           cases.forEach(tc => {
             generatedCases.push({
@@ -1342,7 +1343,7 @@ app.post('/api/testcase/ai', authMiddleware, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model:      'claude-3-5-sonnet-20241022',
+        model:      'claude-sonnet-4-5-20251001',
         max_tokens: 16000,
         messages:   [{ role: 'user', content: prompt }]
       })
