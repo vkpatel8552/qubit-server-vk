@@ -1048,7 +1048,7 @@ function buildStorySummary(stories) {
       `## Story ${i+1}: ${s.id} — ${s.title}`,
       ``,
       `### Description`,
-      s.desc || '(no description)',
+      (s.desc || '(no description)').slice(0, 800),
       ``,
       `### Requirements (${reqs.length})`,
       reqText
@@ -1338,7 +1338,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
-    const BATCH_SIZE = 3; // stories per Claude call
+    const BATCH_SIZE = 2; // 2 stories per call — keeps output well under 16k token limit
 
     if(!ANTHROPIC_KEY){
       log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
@@ -1382,7 +1382,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
               headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
               body: JSON.stringify({
                 model:      'claude-sonnet-4-6',
-                max_tokens: 8000,
+                max_tokens: 16000,
                 system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
                 messages:   [{role:'user', content: prompt}]
               })
