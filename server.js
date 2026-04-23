@@ -1109,178 +1109,211 @@ OUTPUT — return ONLY valid JSON, no other text
 
 app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const {projectName,release,epics,prefix}=req.body||{};
-  if(!projectName||!Array.isArray(epics)||epics.length===0||!prefix)return res.status(400).json({error:'projectName, epics[], and prefix required'});
-  const connData=await getConnectors(req.user.email);const jira=connData.jira;
-  if(!jira||!jira.connected)return res.status(400).json({error:'Jira connector not configured'});
-  res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-cache');res.setHeader('Connection','keep-alive');res.setHeader('X-Accel-Buffering','no');res.flushHeaders();
-  const send=(event,data)=>{try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){}};
-  const log=(msg,level='info')=>send('log',{msg,level,ts:Date.now()});
-  const phase=(idx,state,sub)=>send('phase',{idx,state,sub});
-  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},15000);
+  if(!projectName||!Array.isArray(epics)||epics.length===0||!prefix)
+    return res.status(400).json({error:'projectName, epics[], and prefix required'});
+
+  const connData=await getConnectors(req.user.email);
+  const jira=connData.jira;
+  if(!jira||!jira.connected)return res.status(400).json({error:'Jira not connected'});
+
+  // SSE setup
+  res.setHeader('Content-Type','text/event-stream');
+  res.setHeader('Cache-Control','no-cache');
+  res.setHeader('Connection','keep-alive');
+  res.setHeader('X-Accel-Buffering','no');
+  res.flushHeaders();
+  const send  = (event,data) => { try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){} };
+  const log   = (msg,level='info') => send('log',{msg,level,ts:Date.now()});
+  const phase = (idx,state,sub)   => send('phase',{idx,state,sub});
+  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },15000);
+
+  // ─── PHASES ────────────────────────────────────────────────────────────────
+  // 0: Authenticate   1: Fetch Epics   2: Find Stories
+  // 3: Fetch Stories  4: Fetch Confluence  5: Generate Test Cases (AI)
+
   try {
-    log(`╔═══ TEST CASE GENERATION STARTED ═══`);
-    log(`Project: ${projectName} · Prefix: ${prefix} · Epics: ${epics.join(', ')}`);
-    const client=new AtlassianClient({email:jira.jiraEmail,apiToken:getJiraToken(jira),siteUrl:jira.siteUrl});
-    phase(0,'active','');const me=await client.ping();log(`✓ Authenticated as ${me.displayName}`,'ok');phase(0,'done',`✓ ${me.displayName}`);
-    let fieldMap={};
-    try{fieldMap=await getFieldMap(client);log(`✓ Field mapping loaded`,'ok');}catch(e){log(`⚠ Field mapping unavailable`,'warn');}
-    phase(1,'active',`0 of ${epics.length}`);const epicsMeta=[];
+    log(`╔═══ TEST CASE GENERATION ═══`);
+    log(`Project: ${projectName} | Prefix: ${prefix} | Epics: ${epics.join(', ')}`);
+
+    // ─── Phase 0: Authenticate ───────────────────────────────────────────────
+    phase(0,'active','');
+    const client = new AtlassianClient({email:jira.jiraEmail,apiToken:getJiraToken(jira),siteUrl:jira.siteUrl});
+    const me = await client.ping();
+    log(`✓ Authenticated as ${me.displayName}`,'ok');
+    phase(0,'done',`${me.displayName}`);
+
+    // ─── Phase 1: Fetch epic metadata ────────────────────────────────────────
+    phase(1,'active',`0 of ${epics.length}`);
+    const epicsMeta = [];
     for(let i=0;i<epics.length;i++){
-      const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);
-      const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority']),CONFIG.mcp.maxRetries,log);
-      const dt=adfToPlainText(epic.fields.description);
-      const roles=await extractEpicRoles(client,id,epic.fields,fieldMap);
-      epicsMeta.push({id,meta:{key:epic.key,title:epic.fields.summary,description:dt,assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',engineeringManager:roles.engineeringManager,qaValidator:roles.qaValidator,stakeholders:roles.stakeholders}});
-      log(`✓ Epic loaded: ${epicsMeta[epicsMeta.length-1].meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);
+      const id=epics[i];
+      log(`Fetching epic ${i+1}/${epics.length}: ${id}`);
+      const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status']),CONFIG.mcp.maxRetries,log);
+      epicsMeta.push({id, title: epic.fields.summary});
+      log(`✓ ${id}: ${epic.fields.summary}`,'ok');
+      phase(1,'active',`${i+1} of ${epics.length}`);
     }
-    phase(1,'done',`${epics.length} epics fetched`);
+    phase(1,'done',`${epics.length} epic(s) loaded`);
+
+    // ─── Phase 2: Find stories under each epic ───────────────────────────────
     phase(2,'active','');
-    const slbe={};let totalStories=0;
-    for(const em of epicsMeta){const jql=`parent in (${em.id}) AND issuetype = Story`;const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const issues=sr.issues||[];slbe[em.id]=issues;log(`✓ ${issues.length} stories for ${em.id}`,'ok');totalStories+=issues.length;}
-    phase(2,'done',`${totalStories} stories found`);if(totalStories===0)log(`⚠ No stories found.`,'warn');
-    phase(3,'active',`0 of ${totalStories}`);const allEpics=[];let done=0;
-    for(const em of epicsMeta){const list=slbe[em.id];const details=list.length>0?await fetchStoriesParallel(client,list,log):[];allEpics.push({id:em.id,meta:em.meta,stories:details});done+=list.length;phase(3,'active',`${done} of ${totalStories}`);}
-    phase(3,'done',`${totalStories} stories enriched`);
-    // Phase 4: Fetch Confluence test plans for each epic
-    phase(4,'active',`0 of ${epicsMeta.length}`);
-    const confluenceByEpic = {};
-    for(let ci=0;ci<epicsMeta.length;ci++){
-      const em=epicsMeta[ci];
-      log(`──── Confluence for ${em.id} ────`);
-      const conf = await fetchConfluenceForEpic(client, em.id, log).catch(() => null);
-      if(conf){confluenceByEpic[em.id]=conf;log(`✓ Confluence: "${conf.title}"`, 'ok');}
-      else{log(`⚠ No Confluence page for ${em.id} — using Jira data only`,'warn');}
-      phase(4,'active',`${ci+1} of ${epicsMeta.length}`);
+    const storyListByEpic = {};
+    let totalStories = 0;
+    for(const em of epicsMeta){
+      const jql=`parent in (${em.id}) AND issuetype = Story ORDER BY created ASC`;
+      const sr=await client.withRetry(`stories(${em.id})`,()=>client.searchByJql(jql,['summary','status'],100),CONFIG.mcp.maxRetries,log);
+      storyListByEpic[em.id] = sr.issues||[];
+      totalStories += storyListByEpic[em.id].length;
+      log(`✓ ${em.id}: ${storyListByEpic[em.id].length} stories`,'ok');
     }
-    phase(4,'done',`Confluence fetched for ${Object.keys(confluenceByEpic).length} of ${epicsMeta.length} epics`);
-    // Phase 5: Enrich and send to client for generation
-    phase(5,'active','Preparing enriched data');
-    const enrichedEpics = allEpics.map(e => ({
-      ...e,
-      confluenceTitle: confluenceByEpic[e.id] ? confluenceByEpic[e.id].title : null,
-      confluenceContent: confluenceByEpic[e.id] ? confluenceByEpic[e.id].content : null
-    }));
-    phase(5,'done','Ready');
+    if(totalStories===0){ log(`⚠ No stories found — check epic IDs and Jira permissions`,'warn'); }
+    phase(2,'done',`${totalStories} stories found`);
 
-    // Phase 6: Fetch existing test plan scenarios for these epics
-    phase(5,'active','Fetching test plan scenarios from database...');
-    let existingPlanScenarios = null;
-    try {
-      const epicIds = enrichedEpics.map(e => e.id);
-      const planRow = await db(
-        `SELECT summary FROM test_plans WHERE email=$1 AND epics::text ~ ANY($2::text[]) ORDER BY generated_at DESC LIMIT 1`,
-        [req.user.email.toLowerCase(), epicIds.map(id => `"${id}"`)]
-      );
-      if (planRow.rows[0] && planRow.rows[0].summary) {
-        const planSum = planRow.rows[0].summary;
-        const planEpics = planSum.epics || [];
-        const storyCount = planEpics.reduce((a, e) => a + (e.stories||[]).length, 0);
-        log(`✓ Found test plan "${planSum.project || 'unnamed'}" — ${planEpics.length} epic(s), ${storyCount} story(s)`, 'ok');
-        // Log every story title so user can see what scenarios will drive TC generation
-        planEpics.forEach(function(e) {
-          log(`  Epic ${e.epicKey}: ${e.epicTitle}`, 'ok');
-          (e.stories||[]).forEach(function(s) {
-            log(`    • Story ${s.storyKey}: ${s.storyTitle}`, 'ok');
-          });
+    // ─── Phase 3: Fetch full story details (same as test plan) ───────────────
+    // Uses fetchStoriesParallel → each story gets: id, title, desc (full text), ac (extracted requirements)
+    phase(3,'active',`0 of ${totalStories}`);
+    const allEpics = [];
+    let fetched = 0;
+    for(const em of epicsMeta){
+      const list = storyListByEpic[em.id];
+      let stories = [];
+      if(list.length>0){
+        stories = await fetchStoriesParallel(client, list, log);
+        fetched += stories.length;
+        phase(3,'active',`${fetched} of ${totalStories}`);
+        // Log what we got
+        stories.forEach(s => {
+          log(`  ${s.id}: ${s.title.slice(0,50)} — ${s.desc.length} chars, ${s.ac.length} requirements`,'ok');
         });
-        existingPlanScenarios = planEpics.flatMap(e =>
-          (e.stories||[]).map(s => ({
-            storyKey:   s.storyKey,
-            storyTitle: s.storyTitle,
-            ac:         s.acceptanceCriteria || []
-          }))
-        );
-        log(`✓ ${existingPlanScenarios.length} stories from test plan will guide test case generation`, 'ok');
-      } else {
-        log(`⚠ No existing test plan found for these epics — scenarios will be derived from Jira ACs`, 'warn');
       }
-    } catch(planErr) {
-      log(`⚠ Could not fetch test plan: ${planErr.message} — proceeding with Jira data`, 'warn');
+      allEpics.push({id:em.id, title:em.title, stories});
     }
-    phase(5,'done','Test plan scenarios loaded');
+    phase(3,'done',`${totalStories} stories fetched with full descriptions`);
 
-    // Phase 6: AI test case generation (server-side — needs API key)
-    phase(5,'active','Generating test cases with AI...');
-    log(`╔═══ GENERATING TEST CASES VIA CLAUDE AI ═══`,'ok');
-    let generatedCases = [];
+    // ─── Phase 4: Fetch Confluence notes ─────────────────────────────────────
+    phase(4,'active','');
+    const confluenceByEpic = {};
+    for(const em of epicsMeta){
+      const conf = await fetchConfluenceForEpic(client, em.id, log).catch(()=>null);
+      if(conf){ confluenceByEpic[em.id]=conf; log(`✓ Confluence: "${conf.title}"`,'ok'); }
+      else     { log(`  No Confluence page for ${em.id}`,'info'); }
+    }
+    phase(4,'done',`Confluence: ${Object.keys(confluenceByEpic).length} of ${epicsMeta.length} found`);
+
+    // ─── Phase 5: Generate test cases via Claude AI ───────────────────────────
+    phase(5,'active','Calling Claude AI...');
+    log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-    if (!ANTHROPIC_KEY) {
-      log(`⚠ ANTHROPIC_API_KEY not set on Render. Add it: Render → Environment → ANTHROPIC_API_KEY = sk-ant-... — test cases will use basic fallback until set`,'warn');
+    const generatedCases = [];
+
+    if(!ANTHROPIC_KEY){
+      log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
+      log(`  Add it: Render → service → Environment → ANTHROPIC_API_KEY = sk-ant-...`,'warn');
     } else {
-      for (const epic of enrichedEpics) {
-        const stories = epic.stories || [];
-        if (!stories.length) continue;
-        log(`  Generating TCs for epic: ${epic.meta?.title || epic.id}`,'ok');
-        // Build AC inventory
-        // Build story summaries — same structured format as test plan storage
-        // Each summary combines: title + full description + extracted requirements
-        const storySummaries = stories.map(s => {
-          const reqs = (s.ac||[]).filter(a => a !== 'Acceptance criteria unavailable');
-          return {
-            id:               s.id,
-            title:            s.title || s.id,
-            fullDescription:  s.desc || '',    // full plain-text from adfToPlainText (no cap)
-            requirements:     reqs             // all extracted from description — bullets, table rows, paragraphs
-          };
-        });
+      let caseNum = 1;
+      for(const epic of allEpics){
+        const stories = epic.stories||[];
+        if(!stories.length){ log(`  Skipping ${epic.id} — no stories`,'warn'); continue; }
 
-        const totalReqs = storySummaries.reduce((sum, s) => sum + s.requirements.length, 0);
-        log(`  📋 ${stories.length} stories | ${totalReqs} requirements extracted:`, 'ok');
-        storySummaries.forEach(s => {
-          log(`     ${s.id} — "${s.title.slice(0,50)}" → ${s.requirements.length} reqs`, 'ok');
-          s.requirements.slice(0,3).forEach(r => log(`       • ${r.slice(0,70)}`, 'ok'));
-        });
+        log(`\n  Epic: ${epic.title||epic.id} (${stories.length} stories)`,'ok');
+        const totalReqs = stories.reduce((n,s)=>n+s.ac.length,0);
+        log(`  Requirements extracted: ${totalReqs} across ${stories.length} stories`,'ok');
+        stories.forEach(s => log(`    ${s.id}: ${s.ac.length} reqs — ${s.title.slice(0,50)}`,'ok'));
 
-        // Build formatted story block for Claude — narrative summary
-        const storyBlock = storySummaries.map((s, i) => {
-          const reqList = s.requirements.length > 0
-            ? s.requirements.map((r, ri) => `  ${ri+1}. ${r}`).join('\n')
-            : '  (derive from full description below)';
-          return `STORY ${i+1}: ${s.id} — ${s.title}\n\nFull Description:\n${s.fullDescription}\n\nExtracted Requirements:\n${reqList}`;
-        }).join('\n\n' + '─'.repeat(60) + '\n\n');
+        // Build the story block sent to Claude
+        const storyBlock = stories.map((s,i) => {
+          const reqText = s.ac.length > 0
+            ? s.ac.map((r,ri) => `  ${ri+1}. ${r}`).join('\n')
+            : '  (read full description below — no structured requirements found)';
+          return [
+            `STORY ${i+1}: ${s.id} — ${s.title}`,
+            ``,
+            `Full Description:`,
+            s.desc || '(no description)',
+            ``,
+            `Requirements:`,
+            reqText
+          ].join('\n');
+        }).join('\n\n' + '─'.repeat(50) + '\n\n');
 
-        const confBlock = epic.confluenceContent ? `\n\nConfluence Notes:\n${epic.confluenceContent.slice(0,1500)}` : '';
-        const prompt = buildServerTCPrompt(epic.meta?.title || epic.id, epic.id, storyBlock, confBlock);
+        const confNote = confluenceByEpic[epic.id]
+          ? `\n\nConfluence Notes (${confluenceByEpic[epic.id].title}):\n${confluenceByEpic[epic.id].content.slice(0,1500)}`
+          : '';
+
+        const prompt = buildServerTCPrompt(epic.title||epic.id, epic.id, storyBlock, confNote);
+        log(`  Sending to Claude (${prompt.length} chars)...`,'info');
 
         try {
           const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: 'claude-3-5-sonnet-20241022', max_tokens: 16000, messages: [{ role: 'user', content: prompt }] })
+            method:'POST',
+            headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
+            body: JSON.stringify({
+              model: 'claude-3-5-sonnet-20241022',
+              max_tokens: 16000,
+              messages: [{role:'user', content: prompt}]
+            })
           });
+
           const aiData = await aiResp.json();
-          if (!aiResp.ok) throw new Error(aiData.error?.message || `API ${aiResp.status}`);
-          let raw = (aiData.content?.[0]?.text || '').replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
-          const parsed = JSON.parse(raw);
-          const cases = Array.isArray(parsed) ? parsed : (parsed.testCases || parsed.cases || []);
-          if (!cases.length) throw new Error('0 cases returned');
-          let caseNum = (generatedCases.length || 0) + 1;
+          if(!aiResp.ok) throw new Error(`Anthropic API error ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
+
+          const rawText = (aiData.content?.[0]?.text || '').trim();
+          log(`  Claude responded: ${rawText.length} chars`,'ok');
+
+          // Robust JSON extraction — find first [ to last ]
+          const jsonStart = rawText.indexOf('[');
+          const jsonEnd   = rawText.lastIndexOf(']');
+          if(jsonStart === -1 || jsonEnd === -1) throw new Error(`No JSON array in response. Preview: ${rawText.slice(0,200)}`);
+
+          const jsonStr = rawText.slice(jsonStart, jsonEnd+1);
+          const parsed  = JSON.parse(jsonStr);
+          const cases   = Array.isArray(parsed) ? parsed : [];
+          if(!cases.length) throw new Error(`Claude returned empty array. Raw: ${rawText.slice(0,200)}`);
+
           cases.forEach(tc => {
             generatedCases.push({
               caseId:        `${prefix}-${String(caseNum++).padStart(3,'0')}`,
-              title:         (tc.title||`Validate ${epic.meta?.title||epic.id}`).trim(),
+              title:         (tc.title||`Validate ${epic.title||epic.id}`).trim(),
               category:      tc.category || 'Positive Flows',
               preconditions: (tc.preconditions||'').replace(/\n+/g,' ').trim(),
               credentials:   tc.credentials || 'Account Manager',
-              stories:       tc.storyIds || stories.map(s => s.id),
+              stories:       tc.storyIds || stories.map(s=>s.id),
               acRefs:        tc.acRefs || [],
-              steps:         (tc.steps||[]).map((s,i) => ({ stepNum: i+1, action: (s.action||'').trim(), expectedResult: (s.expectedResult||s.expected||'').trim() }))
+              steps:         (tc.steps||[]).map((s,si) => ({
+                stepNum:        si+1,
+                action:         (s.action||'').trim(),
+                expectedResult: (s.expectedResult||s.expected||'').trim()
+              }))
             });
           });
-          log(`  ✓ ${cases.length} test case(s) for ${epic.meta?.title||epic.id}`,'ok');
+          log(`  ✓ ${cases.length} test case(s) generated`,'ok');
+
         } catch(aiErr) {
-          const errMsg = aiErr.message || 'unknown';
-          log(`  ✗ AI generation failed for ${epic.id}: ${errMsg}`,'err');
-          log(`  ℹ Check: ANTHROPIC_API_KEY set? API quota? JSON parse error?`,'warn');
+          log(`  ✗ AI failed for ${epic.id}: ${aiErr.message}`,'err');
         }
       }
     }
+
     phase(5,'done',`${generatedCases.length} test cases generated`);
-    log(`╚═══ GENERATION COMPLETE — sending to client ═══`,'ok');
-    send('complete',{projectName,release,epics,prefix,allEpics:enrichedEpics,totalStories,generatedBy:req.user.fullName,site:jira.siteUrl,confluenceByEpic,existingPlanScenarios,generatedCases});
-  }catch(err){console.error('[tc-gen]',err);try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}}
-  finally{clearInterval(hb);try{res.end();}catch(e){}}
+    log(`╚═══ COMPLETE: ${generatedCases.length} test cases ═══`,'ok');
+    send('complete',{
+      projectName, release, epics, prefix,
+      allEpics,
+      totalStories,
+      generatedBy:    req.user.fullName,
+      site:           jira.siteUrl,
+      generatedCases
+    });
+
+  } catch(err) {
+    console.error('[tc-gen]',err);
+    try{ log(`✗ FAILED: ${err.message}`,'err'); send('error',{error:err.message||'Unknown error'}); }catch(e){}
+  } finally {
+    clearInterval(hb);
+    try{ res.end(); }catch(e){}
+  }
 });
+
 
 app.post('/api/testcase/save', authMiddleware, async (req, res) => {
   const {tcId,projectName,release,prefix,epics,cases,totals}=req.body||{};
