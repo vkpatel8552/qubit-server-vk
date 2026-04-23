@@ -1283,11 +1283,17 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
           log(`  Claude response: ${rawText.length} chars, usage: ${aiData.usage?.input_tokens||'?'} in / ${aiData.usage?.output_tokens||'?'} out`,'ok');
 
           // Robust JSON extraction: find first [{  to last }]
-          const jsonStart = rawText.search(/\[\s*\{/);
-          const jsonEnd   = rawText.lastIndexOf('}]');
-          if(jsonStart === -1 || jsonEnd === -1) throw new Error(`No JSON array found. Response preview: ${rawText.slice(0,300)}`);
-
-          const jsonStr = rawText.slice(jsonStart, jsonEnd + 2); // +2 to include '}]'
+          // Robust JSON extraction: strip markdown fences first, then find array
+          let cleanRaw = rawText
+            .replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
+          // Find start of JSON array
+          const jsonStart = cleanRaw.search(/\[\s*\{/);
+          // Find end: last } followed by optional whitespace then ]
+          const jsonEndMatch = cleanRaw.search(/\}\s*\]\s*$/);
+          if(jsonStart === -1 || jsonEndMatch === -1) throw new Error(`No JSON array found. Response preview: ${rawText.slice(0,300)}`);
+          // Extract from [ to the closing ]
+          const lastBracket = cleanRaw.lastIndexOf(']');
+          const jsonStr = cleanRaw.slice(jsonStart, lastBracket + 1).replace(/,\s*\]/, ']'); // remove trailing comma
           const cases   = JSON.parse(jsonStr);
           if(!Array.isArray(cases) || !cases.length) throw new Error(`Empty array returned. Raw: ${rawText.slice(0,200)}`);
 
