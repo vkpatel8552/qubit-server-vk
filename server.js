@@ -1123,9 +1123,31 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
         } else {
           log(`  📋 No structured ACs found — Claude will derive requirements from full story descriptions`, 'warn');
         }
-        const acList = acInventory.length > 0
-          ? acInventory.map((a,i) => `${i+1}. [${a.ref}] ${a.ac}`).join('\n')
-          : stories.map(s => `Story ${s.id} — ${s.title}: see full description below`).join('\n');
+        // Build requirement list — use structured ACs if present, 
+        // otherwise derive from story descriptions (sentences/bullet points)
+        let acList;
+        if (acInventory.length > 0) {
+          acList = acInventory.map((a,i) => `${i+1}. [${a.ref}] ${a.ac}`).join('\n');
+        } else {
+          // No pre-extracted ACs — build from story descriptions directly
+          let reqNum = 1;
+          const descReqs = [];
+          stories.forEach(s => {
+            const descText = (s.desc||'').trim();
+            if (!descText) return;
+            // Extract bullet points and sentences that sound like requirements
+            const bullets = descText.split('\n')
+              .map(l => l.replace(/^[•\-\*\d]+[\.\)]?\s*/, '').trim())
+              .filter(l => l.length > 15);
+            // Take up to 8 lines per story
+            bullets.slice(0, 8).forEach(line => {
+              descReqs.push(`${reqNum++}. [${s.id}/REQ${reqNum-1}] ${line}`);
+            });
+          });
+          acList = descReqs.length > 0
+            ? descReqs.join('\n')
+            : stories.map(s => `[${s.id}] ${s.title}: ${(s.desc||'').slice(0,200)}`).join('\n');
+        }
 
         const storyBlock = JSON.stringify(stories.map(s => ({
           id: s.id,
@@ -1162,7 +1184,9 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
           });
           log(`  ✓ ${cases.length} test case(s) for ${epic.meta?.title||epic.id}`,'ok');
         } catch(aiErr) {
-          log(`  ✗ AI generation failed for ${epic.id}: ${aiErr.message} — client will use fallback`,'warn');
+          const errMsg = aiErr.message || 'unknown';
+          log(`  ✗ AI generation failed for ${epic.id}: ${errMsg}`,'err');
+          log(`  ℹ Check: ANTHROPIC_API_KEY set? API quota? JSON parse error?`,'warn');
         }
       }
     }
