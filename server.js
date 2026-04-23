@@ -1063,7 +1063,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
           const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 16000, messages: [{ role: 'user', content: prompt }] })
+            body: JSON.stringify({ model: 'claude-3-5-sonnet-20241022', max_tokens: 16000, messages: [{ role: 'user', content: prompt }] })
           });
           const aiData = await aiResp.json();
           if (!aiResp.ok) throw new Error(aiData.error?.message || `API ${aiResp.status}`);
@@ -1124,7 +1124,7 @@ app.post('/api/testcase/ai', authMiddleware, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
+        model:      'claude-3-5-sonnet-20241022',
         max_tokens: 16000,
         messages:   [{ role: 'user', content: prompt }]
       })
