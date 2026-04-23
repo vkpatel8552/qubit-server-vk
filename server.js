@@ -1332,89 +1332,118 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     phase(4,'done',`Confluence: ${Object.keys(confluenceByEpic).length} of ${epicsMeta.length} found`);
 
     // ─── Phase 5: Generate test cases via Claude AI ───────────────────────────
+    // Stories are processed in batches of 3 to keep each prompt manageable.
+    // This avoids token truncation which was causing JSON parse failures.
     phase(5,'active','Calling Claude AI...');
     log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
+    const BATCH_SIZE = 3; // stories per Claude call
 
     if(!ANTHROPIC_KEY){
       log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
       log(`  Add it: Render → service → Environment → ANTHROPIC_API_KEY = sk-ant-...`,'warn');
     } else {
       let caseNum = 1;
+
       for(const epic of allEpics){
-        const stories = epic.stories||[];
-        if(!stories.length){ log(`  Skipping ${epic.id} — no stories`,'warn'); continue; }
+        const allStories = epic.stories||[];
+        if(!allStories.length){ log(`  Skipping ${epic.id} — no stories`,'warn'); continue; }
 
-        log(`\n  Epic: ${epic.title||epic.id} (${stories.length} stories)`,'ok');
-        const totalReqs = stories.reduce((n,s)=>n+s.ac.length,0);
-        log(`  Requirements extracted: ${totalReqs} across ${stories.length} stories`,'ok');
-        stories.forEach(s => log(`    ${s.id}: ${s.ac.length} reqs — ${s.title.slice(0,50)}`,'ok'));
+        log(`  Epic: ${epic.title||epic.id} — ${allStories.length} stories, processing in batches of ${BATCH_SIZE}`,'ok');
 
-        // Build prompt: stories summary doc + Confluence test plan (same approach as skill)
         const confData    = confluenceByEpic[epic.id] || null;
         const confContent = confData ? confData.content : null;
         const confTitle   = confData ? confData.title   : null;
 
-        const prompt = buildServerTCPrompt(epic.title||epic.id, epic.id, stories, confContent, confTitle);
-        log(`  Prompt size: ${prompt.length} chars | stories: ${stories.length} | conf: ${confData?'yes':'no'}`,'info');
-
-        try {
-          const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
-            method:'POST',
-            headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
-            body: JSON.stringify({
-              model:      'claude-sonnet-4-6',
-              max_tokens: 16000,
-              system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no text before or after the JSON. Start your response with [ and end with ].',
-              messages:   [{role:'user', content: prompt}]
-            })
-          });
-
-          const aiData = await aiResp.json();
-          if(!aiResp.ok) throw new Error(`Anthropic API ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
-
-          const rawText = (aiData.content?.[0]?.text || '').trim();
-          log(`  Claude response: ${rawText.length} chars, usage: ${aiData.usage?.input_tokens||'?'} in / ${aiData.usage?.output_tokens||'?'} out`,'ok');
-
-          // Robust JSON extraction: find first [{  to last }]
-          // Robust JSON extraction: strip markdown fences first, then find array
-          let cleanRaw = rawText
-            .replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
-          // Find start of JSON array
-          const jsonStart = cleanRaw.search(/\[\s*\{/);
-          // Find end: last } followed by optional whitespace then ]
-          const jsonEndMatch = cleanRaw.search(/\}\s*\]\s*$/);
-          if(jsonStart === -1 || jsonEndMatch === -1) throw new Error(`No JSON array found. Response preview: ${rawText.slice(0,300)}`);
-          // Extract from [ to the closing ]
-          const lastBracket = cleanRaw.lastIndexOf(']');
-          const jsonStr = cleanRaw.slice(jsonStart, lastBracket + 1).replace(/,\s*\]/, ']'); // remove trailing comma
-          const cases   = JSON.parse(jsonStr);
-          if(!Array.isArray(cases) || !cases.length) throw new Error(`Empty array returned. Raw: ${rawText.slice(0,200)}`);
-
-
-          cases.forEach(tc => {
-            generatedCases.push({
-              caseId:        `${prefix}-${String(caseNum++).padStart(3,'0')}`,
-              title:         (tc.title||`Validate ${epic.title||epic.id}`).trim(),
-              category:      tc.category || 'Positive Flows',
-              preconditions: (tc.preconditions||'').replace(/\n+/g,' ').trim(),
-              credentials:   tc.credentials || 'Account Manager',
-              stories:       tc.storyIds || stories.map(s=>s.id),
-              acRefs:        tc.acRefs || [],
-              steps:         (tc.steps||[]).map((s,si) => ({
-                stepNum:        si+1,
-                action:         (s.action||'').trim(),
-                expectedResult: (s.expectedResult||s.expected||'').trim()
-              }))
-            });
-          });
-          log(`  ✓ ${cases.length} test case(s) generated`,'ok');
-
-        } catch(aiErr) {
-          log(`  ✗ AI failed for ${epic.id}: ${aiErr.message}`,'err');
+        // Split stories into batches
+        const batches = [];
+        for(let i=0; i<allStories.length; i+=BATCH_SIZE){
+          batches.push(allStories.slice(i, i+BATCH_SIZE));
         }
-      }
+
+        for(let bi=0; bi<batches.length; bi++){
+          const batchStories = batches[bi];
+          const batchIds = batchStories.map(s=>s.id).join(', ');
+          log(`  Batch ${bi+1}/${batches.length}: ${batchIds}`,'info');
+
+          const prompt = buildServerTCPrompt(
+            epic.title||epic.id,
+            epic.id,
+            batchStories,
+            bi===0 ? confContent : null,  // only include Confluence in first batch
+            bi===0 ? confTitle   : null
+          );
+          log(`  Prompt: ${prompt.length} chars | ${batchStories.length} stories`,'info');
+
+          try {
+            const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
+              method:'POST',
+              headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
+              body: JSON.stringify({
+                model:      'claude-sonnet-4-6',
+                max_tokens: 8000,
+                system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
+                messages:   [{role:'user', content: prompt}]
+              })
+            });
+
+            const aiData = await aiResp.json();
+            if(!aiResp.ok) throw new Error(`Anthropic API ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
+
+            const rawText = (aiData.content?.[0]?.text || '').trim();
+            log(`  Response: ${rawText.length} chars | tokens: ${aiData.usage?.input_tokens||'?'} in / ${aiData.usage?.output_tokens||'?'} out`,'ok');
+
+            // Robust JSON extraction — handles any whitespace or trailing text
+            let cleanRaw = rawText.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+            const jsonStart = cleanRaw.indexOf('[');
+            const jsonEnd   = cleanRaw.lastIndexOf(']');
+            if(jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart){
+              throw new Error(`No JSON array found. Preview: ${rawText.slice(0,200)}`);
+            }
+            let jsonStr = cleanRaw.slice(jsonStart, jsonEnd+1);
+            // Attempt parse; if truncated, try to repair by closing open objects
+            let cases;
+            try {
+              cases = JSON.parse(jsonStr);
+            } catch(parseErr) {
+              // Response was truncated — try to recover partial cases
+              log(`  ⚠ JSON parse failed (likely truncation), attempting recovery...`,'warn');
+              // Find last complete object by splitting on },{ pattern
+              const lastComplete = jsonStr.lastIndexOf('},');
+              if(lastComplete > jsonStart) {
+                try { cases = JSON.parse(jsonStr.slice(0, lastComplete+1) + ']'); }
+                catch(e){ cases = []; }
+              } else { cases = []; }
+            }
+
+            if(!Array.isArray(cases) || !cases.length){
+              throw new Error(`Empty or invalid array. Raw: ${rawText.slice(0,200)}`);
+            }
+
+            cases.forEach(tc => {
+              generatedCases.push({
+                caseId:        `${prefix}-${String(caseNum++).padStart(3,'0')}`,
+                title:         (tc.title||`Validate ${epic.title||epic.id}`).trim(),
+                category:      tc.category || 'Positive Flows',
+                preconditions: (tc.preconditions||'').replace(/\n+/g,' ').trim(),
+                credentials:   tc.credentials || 'Account Manager',
+                stories:       tc.storyIds || batchStories.map(s=>s.id),
+                acRefs:        tc.acRefs || [],
+                steps:         (tc.steps||[]).map((s,si) => ({
+                  stepNum:        si+1,
+                  action:         (s.action||'').trim(),
+                  expectedResult: (s.expectedResult||s.expected||'').trim()
+                }))
+              });
+            });
+            log(`  ✓ Batch ${bi+1}: ${cases.length} test case(s)`,'ok');
+
+          } catch(aiErr) {
+            log(`  ✗ Batch ${bi+1} failed: ${aiErr.message}`,'err');
+          }
+        } // end batch loop
+      } // end epic loop
     }
 
     phase(5,'done',`${generatedCases.length} test cases generated`);
