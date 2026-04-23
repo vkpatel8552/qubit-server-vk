@@ -444,11 +444,137 @@ async function extractEpicRoles(client, epicKey, epicFields, fieldMap) {
 }
 
 function adfToPlainText(adf) {
-  if(!adf)return''; if(typeof adf==='string')return adf; if(!adf.content)return'';
-  let out='';
-  const walk=node=>{if(node.type==='text'&&node.text)out+=node.text;if(node.type==='hardBreak')out+='\n';if(node.type==='paragraph'||node.type==='heading'){(node.content||[]).forEach(walk);out+='\n';}else if(node.type==='bulletList'||node.type==='orderedList'){(node.content||[]).forEach(item=>{out+='• ';(item.content||[]).forEach(walk);out+='\n';});}else if(node.content)node.content.forEach(walk);};
-  adf.content.forEach(walk); return out.trim();
+  if (!adf) return '';
+  if (typeof adf === 'string') return adf;
+  if (!adf.content) return '';
+  let out = '';
+
+  const walk = (node, prefix) => {
+    prefix = prefix || '';
+    if (!node) return;
+
+    switch (node.type) {
+      case 'text':
+        out += node.text || '';
+        break;
+      case 'hardBreak':
+        out += '\n';
+        break;
+      case 'paragraph':
+        (node.content || []).forEach(n => walk(n, prefix));
+        out += '\n';
+        break;
+      case 'heading':
+        out += '\n';
+        (node.content || []).forEach(n => walk(n, prefix));
+        out += '\n';
+        break;
+      case 'bulletList':
+      case 'orderedList':
+        (node.content || []).forEach((item, i) => {
+          out += prefix + '• ';
+          (item.content || []).forEach(n => walk(n, prefix + '  '));
+        });
+        break;
+      case 'listItem':
+        (node.content || []).forEach(n => walk(n, prefix));
+        break;
+      case 'table':
+        // Extract table rows as readable text — captures requirement tables like ENG-2955
+        (node.content || []).forEach(row => {
+          const cells = [];
+          (row.content || []).forEach(cell => {
+            let cellText = '';
+            const orig = out;
+            out = '';
+            (cell.content || []).forEach(n => walk(n, ''));
+            cellText = out.trim();
+            out = orig;
+            if (cellText) cells.push(cellText);
+          });
+          if (cells.length > 0) out += cells.join(' | ') + '\n';
+        });
+        break;
+      case 'tableRow':
+      case 'tableHeader':
+      case 'tableCell':
+        (node.content || []).forEach(n => walk(n, prefix));
+        break;
+      case 'blockquote':
+        out += '> ';
+        (node.content || []).forEach(n => walk(n, prefix));
+        out += '\n';
+        break;
+      case 'codeBlock':
+        (node.content || []).forEach(n => walk(n, prefix));
+        out += '\n';
+        break;
+      case 'rule':
+        out += '\n---\n';
+        break;
+      default:
+        if (node.content) node.content.forEach(n => walk(n, prefix));
+    }
+  };
+
+  adf.content.forEach(node => walk(node, ''));
+  return out.trim();
 }
+
+// Extract ALL meaningful content from a story description as requirement lines.
+// NO heading filtering — every bullet, table row, and meaningful sentence is a requirement.
+function extractAcceptanceCriteria(descText) {
+  if (!descText) return [];
+  const results = [];
+  const seen = new Set();
+
+  function addLine(line) {
+    line = line.trim();
+    // Remove ADF artifacts and leading markers
+    line = line.replace(/^[•\-\*]\s*/, '').replace(/^\d+[\.\)]\s*/, '').trim();
+    if (line.length < 8) return;          // too short to be meaningful
+    if (seen.has(line.toLowerCase())) return; // deduplicate
+    // Skip pure section headings (short lines without verbs or details)
+    if (line.length < 20 && !/\b(is|are|should|must|will|can|do|does|has|have|when|if|then|not|no|all|any|the)\b/i.test(line)) return;
+    seen.add(line.toLowerCase());
+    results.push(line);
+  }
+
+  const lines = descText.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // Bullet point or numbered item
+    const bulletMatch = trimmed.match(/^[•\-\*]\s*(.{8,})/) || trimmed.match(/^\d+[\.\)]\s*(.{8,})/);
+    if (bulletMatch) {
+      addLine(bulletMatch[1]);
+      continue;
+    }
+
+    // Table row (pipe-separated) — each cell is a requirement
+    if (trimmed.includes(' | ')) {
+      const cells = trimmed.split(' | ').map(c => c.trim()).filter(c => c.length > 8);
+      // Skip pure header rows (all short words or "---")
+      if (cells.some(c => c.includes(' ') && !c.startsWith('-'))) {
+        cells.forEach(cell => addLine(cell));
+      }
+      continue;
+    }
+
+    // Paragraph sentence (skip short headings, keep meaningful sentences)
+    if (trimmed.length > 30 && !trimmed.startsWith('#') && !trimmed.startsWith('---')) {
+      // Split long paragraphs into sentences
+      const sentences = trimmed.split(/(?<=[.!?])\s+/);
+      for (const sentence of sentences) {
+        if (sentence.length > 20) addLine(sentence);
+      }
+    }
+  }
+
+  return results.slice(0, 40); // max 40 requirements per story
+}
+
 
 function extractAcceptanceCriteria(descText) {
   if (!descText) return [];
@@ -558,15 +684,16 @@ async function fetchStoriesParallel(client, stories, onLog) {
           ()=>client.getIssue(story.key,['summary','description','status','priority','assignee']),
           CONFIG.mcp.maxRetries,onLog
         );
-        const dt=adfToPlainText(d.fields.description);
-        const fullDesc = getFullDesc(dt);
+        const dt = adfToPlainText(d.fields.description);
+        const fullDesc = dt.trim();
+        const extractedAc = extractAcceptanceCriteria(fullDesc); // all content, no heading filter
         results[i]={
-          id:   d.key,
-          title:d.fields.summary,
-          desc: fullDesc,     // full description — no extraction, no truncation
-          ac:   []            // not pre-extracted — Claude reads desc directly
+          id:    d.key,
+          title: d.fields.summary,
+          desc:  fullDesc,          // full description text
+          ac:    extractedAc        // all requirements extracted from description
         };
-        if(onLog)onLog(`  worker-${wid} ✓ ${story.key} — ${fullDesc.length} chars (${i+1}/${stories.length})`,'ok');
+        if(onLog)onLog(`  worker-${wid} ✓ ${story.key} — ${fullDesc.length} chars, ${extractedAc.length} requirements (${i+1}/${stories.length})`,'ok');
       }catch(err){
         if(onLog)onLog(`  worker-${wid} ✗ ${story.key} — ${err.message}`,'err');
         results[i]={id:story.key,title:(story.fields&&story.fields.summary)||story.key,desc:'(description unavailable)',ac:[]};
