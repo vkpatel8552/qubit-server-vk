@@ -1029,101 +1029,81 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 
 
 
-function buildServerTCPrompt(epicTitle, epicId, storyBlockJson, acList, confBlock) {
-  return `You are a Senior QA Architect generating automation-ready test cases for the ClearlyRated QA team.
+
+function buildServerTCPrompt(epicTitle, epicId, storyBlock, confBlock) {
+  return `You are a Senior QA Architect generating test cases for ClearlyRated.
 
 Epic: ${epicTitle} (${epicId})
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 1 — READ AND UNDERSTAND THE STORIES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STORY DETAILS — read every word of every story
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Each story below contains a full description that may include: Background, Requirements, Behavior sections, Edge Cases, Flag logic, QA Notes, or any other content.
+Each story has:
+- Full Description: the complete story content as written in Jira (background, requirements, behaviors, edge cases, tables, QA notes — everything)
+- Extracted Requirements: key requirements auto-identified from the description
 
-READ THE ENTIRE fullDescription FOR EVERY STORY.
-Do not look for a specific "Acceptance Criteria" label.
-Derive all testable requirements from the full description — every stated behavior, rule, constraint, edge case, and expected outcome is a potential test case step.
+Read BOTH sections for every story. The Full Description is the primary source. The Extracted Requirements are a quick reference — they may be incomplete.
 
-Story data:
-
-${storyBlockJson}
+${storyBlock}
 ${confBlock}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 2 — IDENTIFY WHAT NEEDS TO BE TESTED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO GROUP INTO TEST CASES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-After reading all stories, identify the distinct functional behaviors to test. Group them by:
-- What the user can see or do
-- System behaviors that produce a visible result
-- Conditional logic (flag ON vs OFF, role A vs role B, state A vs state B)
-- Error states, edge cases, and recovery flows
+After reading all stories, group requirements into test cases by functional behavior:
 
-Pre-identified requirements (may be incomplete — supplement with what you read in the full descriptions above):
-${acList}
+SAME test case when:
+- Requirements test the same feature behavior in the same user flow
+- Same user account and same screen — steps follow naturally from each other
+- Example: card display + clicking Subscribe + drawer defaults + key contacts + save = ONE test case
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 3 — TEST CASE GROUPING RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEW test case when:
+- Different user account or role is needed (different user = different automation script)
+- Genuinely different feature area (flag control vs email content vs analytics logging)
+- A test condition needs completely different setup (Account A with X, Account B with Y)
 
-GROUP INTO ONE TEST CASE when:
-- Steps test the same functional behavior in the same user flow
-- Same user account, same screen, naturally sequential
-- Example: "card appears → click Subscribe → drawer opens → defaults set → key contacts populated → save → State B" → ONE test case
+Expected: 4–8 test cases per epic.
 
-CREATE A NEW TEST CASE when:
-- A different user identity is needed (different role, different firm, different account)
-- A genuinely different functional area (flag behavior vs. drawer settings vs. recipient management)
-- Testing multiple conditions (Account A with X, Account B with Y) — use "Account A:", "Account B:" step prefixes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO WRITE STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Never split test cases along story boundaries.
-Expected output: 4–8 test cases for this epic.
+TITLE: "Validate [what is being tested from the requirements]: [key behaviors]"
+- Derived from the requirements you cover — never from story titles or IDs
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 4 — HOW TO WRITE EACH TEST CASE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRECONDITIONS: One sentence with semicolons — the exact data state before step 1
+- "Firm A with flag OFF; Firm B with flag ON; Account B1 has 2 key contacts assigned"
 
-TITLE: "Validate [component/behavior]: [all flows covered]"
-— Derived from WHAT IS BEING TESTED, never from story names or IDs
-— ✅ "Validate Feature Flag activation, auto-enrollment of accounts, and NEW badge lifecycle"
-— ✅ "Validate Performance Digest card State A to State B subscription flow"
-— ❌ "Validate ENG-2942 requirements"
+STEPS (12–18 per test case):
+- Start directly at the feature: "Navigate to Insights > Overview for Account B1"
+- "Verify" starts most steps — it is the dominant pattern in QA at ClearlyRated
+- Use exact UI copy, button names, and values from the story descriptions
+- For role tests: "Log out and log in as [Role]; navigate to [page]"
+- For multi-condition tests: "Account A (flag ON): [verify]" / "Account B (flag OFF): [verify]"
+- Expected results: specific, observable — counts, states, colors, exact text
+- Never: "Assert:", "API call", "HTTP", "DevTools", "DOM", or vague phrases like "it works"
 
-PRECONDITIONS: One sentence with semicolons — exact data state needed before step 1
-— ✅ "Firm A with flag OFF; Firm B with flag ON; Account B1 has 2 key contacts; no digest sent yet"
-— ❌ "User is logged in"
-
-CREDENTIALS: Exact role — "Account Manager", "CR Employee", "Admin", "Various roles"
-
-STEPS (12–18 per test case, max 20 for complex multi-condition scenarios):
-— "Verify" starts most steps — it is the dominant pattern
-— First step: "Navigate to [exact page]." — NOT "Log in as..."
-— Full navigation context: "Navigate to Insights > Overview for Account B1 (Firm B, flag ON)"
-— For role switches: "Log out and log in as [Role]; navigate to [page]."
-— For multi-account conditions: "Account A (flag ON): [verify/action]"
-— Expected results quote exact UI copy from the story description: 'Settings saved.', 'Key Contact', 'State B'
-— Expected results describe counts, colors, states: 'green dot', '2 of 2 digests active', 'NEW badge'
-— Plain English — no "Assert:", "API call", "HTTP", "DOM", "DevTools"
-— Never vague: "it works", "is visible", "is correct"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT — return ONLY valid JSON, nothing else
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT — return ONLY valid JSON, no other text
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [
   {
-    "title": "Validate [component]: [behaviors covered]",
+    "title": "Validate [specific behaviors from requirements]",
     "category": "Positive Flows",
-    "preconditions": "[exact data state for this test case]",
+    "preconditions": "[exact data state]",
     "credentials": "[exact role]",
     "storyIds": ["${epicId}"],
     "acRefs": [],
     "steps": [
-      { "action": "Navigate to [exact screen].", "expectedResult": "[what appears on screen]" },
-      { "action": "Verify [specific thing].", "expectedResult": "[exact observable result, quoted copy]" }
+      { "action": "Navigate to [exact page/section].", "expectedResult": "[specific state on screen]" },
+      { "action": "Verify [specific behavior].", "expectedResult": "[exact observable result with quoted copy]" }
     ]
   }
-]`;}
+]`;
+}
 
 
 
@@ -1232,58 +1212,36 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
         if (!stories.length) continue;
         log(`  Generating TCs for epic: ${epic.meta?.title || epic.id}`,'ok');
         // Build AC inventory
-        const acInventory = [];
-        stories.forEach((s,si) => {
-          // Include both extracted ACs and full description — Claude reads ALL of it
-          const storyReqs = (s.ac||[]).filter(a => a !== 'Acceptance criteria unavailable');
-          if (storyReqs.length > 0) {
-            storyReqs.forEach((ac,ai) => {
-              acInventory.push({ ref: `${s.id}/AC${ai+1}`, story: s.id, title: s.title||'', ac });
-            });
-          }
+        // Build story summaries — same structured format as test plan storage
+        // Each summary combines: title + full description + extracted requirements
+        const storySummaries = stories.map(s => {
+          const reqs = (s.ac||[]).filter(a => a !== 'Acceptance criteria unavailable');
+          return {
+            id:               s.id,
+            title:            s.title || s.id,
+            fullDescription:  s.desc || '',    // full plain-text from adfToPlainText (no cap)
+            requirements:     reqs             // all extracted from description — bullets, table rows, paragraphs
+          };
         });
-        // Log what we found
-        if (acInventory.length > 0) {
-          log(`  📋 ${acInventory.length} extracted ACs across ${stories.length} stories`, 'ok');
-          acInventory.slice(0, 5).forEach(a => log(`     [${a.ref}] ${a.ac.slice(0,70)}`, 'ok'));
-          if (acInventory.length > 5) log(`     ... and ${acInventory.length - 5} more`, 'ok');
-        } else {
-          log(`  📋 No structured ACs found — Claude will derive requirements from full story descriptions`, 'warn');
-        }
-        // Build requirement list — use structured ACs if present, 
-        // otherwise derive from story descriptions (sentences/bullet points)
-        let acList;
-        if (acInventory.length > 0) {
-          acList = acInventory.map((a,i) => `${i+1}. [${a.ref}] ${a.ac}`).join('\n');
-        } else {
-          // No pre-extracted ACs — build from story descriptions directly
-          let reqNum = 1;
-          const descReqs = [];
-          stories.forEach(s => {
-            const descText = (s.desc||'').trim();
-            if (!descText) return;
-            // Extract bullet points and sentences that sound like requirements
-            const bullets = descText.split('\n')
-              .map(l => l.replace(/^[•\-\*\d]+[\.\)]?\s*/, '').trim())
-              .filter(l => l.length > 15);
-            // Take up to 8 lines per story
-            bullets.slice(0, 8).forEach(line => {
-              descReqs.push(`${reqNum++}. [${s.id}/REQ${reqNum-1}] ${line}`);
-            });
-          });
-          acList = descReqs.length > 0
-            ? descReqs.join('\n')
-            : stories.map(s => `[${s.id}] ${s.title}: ${(s.desc||'').slice(0,200)}`).join('\n');
-        }
 
-        const storyBlock = JSON.stringify(stories.map(s => ({
-          id: s.id,
-          title: s.title||'',
-          fullDescription: (s.desc||'').slice(0,3000),   // full description — no pre-filtering
-          extractedACs: (s.ac||[]).filter(a => a !== 'Acceptance criteria unavailable').slice(0,40)
-        })), null, 2);
-        const confBlock = epic.confluenceContent ? `\n\nConfluence notes:\n${epic.confluenceContent.slice(0,1500)}` : '';
-        const prompt = buildServerTCPrompt(epic.meta?.title || epic.id, epic.id, storyBlock, acList, confBlock);
+        const totalReqs = storySummaries.reduce((sum, s) => sum + s.requirements.length, 0);
+        log(`  📋 ${stories.length} stories | ${totalReqs} requirements extracted:`, 'ok');
+        storySummaries.forEach(s => {
+          log(`     ${s.id} — "${s.title.slice(0,50)}" → ${s.requirements.length} reqs`, 'ok');
+          s.requirements.slice(0,3).forEach(r => log(`       • ${r.slice(0,70)}`, 'ok'));
+        });
+
+        // Build formatted story block for Claude — narrative summary
+        const storyBlock = storySummaries.map((s, i) => {
+          const reqList = s.requirements.length > 0
+            ? s.requirements.map((r, ri) => `  ${ri+1}. ${r}`).join('\n')
+            : '  (derive from full description below)';
+          return `STORY ${i+1}: ${s.id} — ${s.title}\n\nFull Description:\n${s.fullDescription}\n\nExtracted Requirements:\n${reqList}`;
+        }).join('\n\n' + '─'.repeat(60) + '\n\n');
+
+        const confBlock = epic.confluenceContent ? `\n\nConfluence Notes:\n${epic.confluenceContent.slice(0,1500)}` : '';
+        const prompt = buildServerTCPrompt(epic.meta?.title || epic.id, epic.id, storyBlock, confBlock);
+
         try {
           const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
