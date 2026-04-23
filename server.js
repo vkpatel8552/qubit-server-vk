@@ -806,65 +806,141 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 // TEST CASE — GENERATE (SSE: fetch Jira data, frontend generates cases)
 
 // Server-side TC prompt builder — same logic as client but runs on Render with real API key
+
 function buildServerTCPrompt(epicTitle, epicId, storyBlockJson, acList, confBlock) {
-  return `You are a Senior QA Architect at ClearlyRated with 20+ years of experience.
-Write test cases for: **${epicTitle}** (${epicId})
+  return `You are a Senior QA Architect generating automation-ready test cases.
 
-## TWO HARD RULES
+Epic: ${epicTitle} (${epicId})
 
-### RULE 1: Different user or role = always a separate test case
-Never combine steps for different users, accounts, or roles in the same test case.
-Each test case uses exactly ONE user identity from start to finish.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10 ABSOLUTE RULES — every rule applies to every test case
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-### RULE 2: Each distinct functional behavior = its own test case
-Even with the same user, split test cases when the functional scenario changes.
-A functional scenario is distinct when it tests a different feature section or needs different test data.
+RULE 1 — TITLE COMES FROM ACCEPTANCE CRITERIA, NEVER FROM STORY NAMES
+Read the ACs you are covering in this test case.
+The title must say what is being validated based on the ACs — not the story title, not the epic name, not the Jira ID.
+Primary assertion (the topmost, most important AC) drives the title. Secondary ACs are added after a comma if they fit.
+✅ "Validate Performance Digest card shows NEW badge and auto-populates key contacts on first load"
+✅ "Validate frequency selector updates helper text instantly and all three options display correctly"
+✅ "Validate all user roles cannot see the Performance Digest card when feature flag is OFF"
+❌ "Validate NPS Performance Digest Story ENG-1234" — story name in title, wrong
+❌ "Validate feature works correctly" — too vague, not from ACs
+❌ "Validate ENG-1234 acceptance criteria" — Jira ID in title, wrong
 
-Example — NPS Digest epic correctly produces MULTIPLE test cases:
-- TC: Subscribe flow, drawer defaults, key contact auto-population, State A→B transition (Account Manager)
-- TC: Settings drawer — frequency options, helper text, per-audience status (Account Manager)
-- TC: Settings drawer — save success, unsaved-changes warning, error/retry (Account Manager)
-- TC: Recipient management — search, add, duplicate check, zero-access warning, key contact sync (Account Manager)
-- TC: Flag OFF — all roles cannot see card, DOM check, URL access denied, data persists on toggle (Various roles)
+RULE 2 — ONE USER IDENTITY PER TEST CASE, NO EXCEPTIONS
+Each test case uses exactly one logged-in user from first step to last step.
+Same user can appear in many different test cases — that is correct and expected.
+Never combine "Account Manager sees X" and "Admin cannot see Y" in the same test case.
+Never combine steps for Firm A (flag ON) and Firm B (flag OFF) in the same test case.
+For role-visibility tests: write one test case per role, or test all roles sequentially in one test case with explicit login/logout steps between each role.
 
-Note: multiple TCs use Account Manager — same user in multiple TCs is CORRECT.
-The split is based on WHAT is being tested, not WHO is testing it.
+RULE 3 — MERGE ACCEPTANCE CRITERIA ACROSS STORIES WHEN THEY SHARE A SCREEN AND A USER
+If Story A and Story B both involve the same screen with the same logged-in user, their ACs belong in the same test case.
+Do not split test cases along story boundaries. Split only on: different user, different screen/feature section, different required test data setup.
+Example: "card appears on page" (Story 1) + "clicking Subscribe opens drawer" (Story 2) + "drawer defaults to Monthly" (Story 3) → ONE test case, because they flow together with the same user on the same screen.
 
-## ACCEPTANCE CRITERIA — cover all, no repeats
+RULE 4 — NO DUPLICATE ASSERTIONS ACROSS TEST CASES
+Once an acceptance criterion is tested in one test case, it must NOT appear in any other test case.
+Every AC in the list below must appear in exactly one test case. Track this carefully.
+If you find yourself writing the same check in two test cases, remove it from the second one.
+
+RULE 5 — MAXIMUM 15 STEPS PER TEST CASE (12–15 is the target for E2E flows)
+Automation scripts must be maintainable. Long test cases break, are hard to debug, and slow to run.
+If a scenario genuinely needs more than 15 steps, split it into two test cases at a natural break point (e.g. after a save action).
+A test case with 8–12 steps is perfectly fine. Not every test case needs to be 15 steps.
+
+RULE 6 — EVERY STEP INCLUDES NAVIGATION CONTEXT
+The first step must always be: log in as [role] and navigate to [exact page/section].
+Subsequent steps that move to a new screen must say: "Navigate to..." or "Open..." or "Click [element] to go to [screen]."
+Never assume the user is already on the right screen — state it explicitly.
+✅ "Log in to ClearlyRated as Account Manager. Navigate to Insights → Overview for Account B1."
+✅ "Click the 'Subscribe' button on the Performance Digest card to open the Settings drawer."
+❌ "Open the drawer" — does not say how to get there
+
+RULE 7 — STEPS AND EXPECTED RESULTS MUST BE SPECIFIC AND OBSERVABLE
+Each step = one clear action + one specific observable result.
+Expected results must describe exactly what appears on screen: text, labels, counts, colors, states.
+Quote exact copy from the ACs where available.
+✅ Action: "Change the frequency selector from Monthly to Weekly."
+✅ Expected: "Weekly is now selected. The helper text below immediately updates to: 'Sends every Monday at 9:30 AM PST. Covers all surveys with a start date in the prior week (Mon–Sun).'"
+✅ Action: "Click the X button on the Settings drawer without saving."
+✅ Expected: "A warning modal appears with the message: 'You have unsaved changes. Save before closing?' and two buttons: 'Save' and 'Discard'."
+❌ Expected: "The drawer closes correctly." — not specific
+❌ Expected: "Settings are saved." — no detail about what the user sees
+
+RULE 8 — PLAIN ENGLISH, NO JARGON
+Never write: "Assert:", "DOM element", "API call", "HTTP 403", "XHR request", "validate via DevTools", "network request", "database record"
+Never write: "it works correctly", "the element is visible", "the component renders", "the system behaves as expected"
+Write like you are explaining to a smart person who has never used this product.
+Every step should be understandable by a non-technical stakeholder.
+
+RULE 9 — PRECONDITIONS MUST BE SPECIFIC TO THIS TEST CASE
+Preconditions: one sentence, semicolons between conditions, describes the exact data and account state needed before step 1.
+✅ "User is logged in as Account Manager; Account B1 has 2 key contacts assigned; feature flag is ON for Firm B; no digest has been sent yet for this account"
+✅ "Firm C has feature flag set to OFF; Account Manager, Admin, and Key Contact test accounts are available at Firm C"
+❌ "User is logged in" — too vague, not actionable
+❌ "Feature is deployed" — not a precondition, always assumed
+
+RULE 10 — CREDENTIALS FIELD = EXACT ROLE
+Write the exact role, not a description.
+✅ "Account Manager", "Admin", "CR Employee", "Key Contact", "Various roles (Account Manager → Admin → Key Contact, tested in sequence)"
+❌ "A logged-in user", "The tester", "QA team"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ACCEPTANCE CRITERIA — cover every single one, no gaps, no duplicates
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 ${acList}
 
-## STEP QUALITY
-Each step = one clear action + one specific observable result.
-- Quote exact copy text, button labels, messages from the ACs
-- Describe states: "green dot", "2 of 2 digests active", "State B", "amber warning"
-- Plain English — someone new to the product understands every step
-- 10–18 steps per test case
-- Never: "Assert:", "API call", "HTTP 403", "DevTools" — plain language only
-- Never vague: "it works", "is visible", "is correct"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STORIES AND FULL ACCEPTANCE CRITERIA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## STORIES & ACS
 ${storyBlockJson}
 ${confBlock}
 
-## PROCESS
-1. Identify distinct functional behaviors from the ACs
-2. Group ACs that test the same behavior together
-3. Split groups that need different users
-4. Write one test case per group (expect 4–8 test cases for a typical epic)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROCESS — follow these steps before writing any test case
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Return ONLY valid JSON array — no markdown, no explanation:
+Step 1: Read all ACs. Group them by what functional behavior they check — ignore story boundaries.
+Step 2: For each group, ask: does this need a different user? If yes, it becomes a separate test case.
+Step 3: For each group, write the test case as a natural flow — login, navigate, act, verify, save/close.
+Step 4: Check step count. If over 15, find the natural split point and create a second test case.
+Step 5: Write the title from the primary AC in the group (topmost, most important assertion).
+Step 6: Verify every AC from the list above appears in exactly one test case. Fill any gaps.
+
+Expected output: 4 to 8 test cases for a typical epic.
+If fewer than 4: you are merging unrelated behaviors — split them.
+If more than 10: you are splitting what should flow together — merge them.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT — return ONLY this, nothing else
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 [
   {
-    "title": "Validate [feature]: [specific flows covered]",
+    "title": "Validate [primary AC being checked], [secondary ACs if space allows]",
     "category": "Positive Flows",
-    "preconditions": "User logged in as [Role]; [specific data state]",
+    "preconditions": "User logged in as [Role]; [specific data state for this test case]",
     "credentials": "[exact role]",
     "storyIds": ["${epicId}"],
-    "acRefs": ["storyId/AC1"],
-    "steps": [{ "action": "...", "expectedResult": "..." }]
+    "acRefs": ["storyId/AC1", "storyId/AC2"],
+    "steps": [
+      {
+        "action": "Log in to ClearlyRated as [Role] and navigate to [exact screen/section].",
+        "expectedResult": "[Exact state of the screen after navigating — what is visible, what elements are present]"
+      },
+      {
+        "action": "[One specific UI action — click, type, select, verify]",
+        "expectedResult": "[What the user sees — exact text, labels, counts, states, colors]"
+      }
+    ]
   }
 ]`;
 }
+
+
 
 app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const {projectName,release,epics,prefix}=req.body||{};
@@ -964,7 +1040,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     let generatedCases = [];
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     if (!ANTHROPIC_KEY) {
-      log(`⚠ ANTHROPIC_API_KEY not set — skipping AI generation, client will fallback`,'warn');
+      log(`⚠ ANTHROPIC_API_KEY not set on Render. Add it: Render → Environment → ANTHROPIC_API_KEY = sk-ant-... — test cases will use basic fallback until set`,'warn');
     } else {
       for (const epic of enrichedEpics) {
         const stories = epic.stories || [];
