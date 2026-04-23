@@ -451,12 +451,49 @@ function adfToPlainText(adf) {
 }
 
 function extractAcceptanceCriteria(descText) {
-  if(!descText)return[];
-  const lines=descText.split('\n').map(l=>l.trim()).filter(Boolean),bullets=[];let inAc=false;
-  for(const line of lines){if(/^(acceptance criteria|requirements|ac:|scenarios|given|when|then|definition of done)/i.test(line)){inAc=true;continue;}if(inAc){if(/^(#|##|background|notes?|open questions|out of scope|implementation|technical)/i.test(line)){inAc=false;continue;}const m=line.match(/^[•\-\*]\s*(.+)/)||line.match(/^\d+[\.\)]\s*(.+)/);if(m)bullets.push(m[1].trim());}}
-  if(bullets.length===0){for(const line of lines){const m=line.match(/^[•\-\*]\s*(.{15,})/);if(m)bullets.push(m[1].trim());if(bullets.length>=12)break;}}
-  return bullets.slice(0,15);
+  if (!descText) return [];
+  const lines = descText.split('\n').map(l => l.trim()).filter(Boolean);
+  const bullets = [];
+  let inAc = false;
+
+  // Pass 1: look for explicit AC section with common headings
+  for (const line of lines) {
+    if (/^(acceptance criteria|ac|acceptance|criteria|requirements|test criteria|definition of done|user acceptance|scenarios|given|when|then)/i.test(line.replace(/[:\-\*#•]+$/, '').trim())) {
+      inAc = true; continue;
+    }
+    if (inAc) {
+      // Stop at next major section
+      if (/^(##|background|notes?|open questions|out of scope|implementation|technical details|design|mockup|non.functional|dependencies|references)/i.test(line)) {
+        inAc = false; continue;
+      }
+      // Grab bullet points
+      const m = line.match(/^[•\-\*]\s*(.+)/) || line.match(/^\d+[\.\)]\s*(.+)/);
+      if (m && m[1].trim().length > 5) bullets.push(m[1].trim());
+    }
+  }
+
+  // Pass 2: if nothing found, grab all substantial bullet points from description
+  if (bullets.length === 0) {
+    for (const line of lines) {
+      const m = line.match(/^[•\-\*]\s*(.{10,})/) || line.match(/^\d+[\.\)]\s*(.{10,})/);
+      if (m) bullets.push(m[1].trim());
+      if (bullets.length >= 25) break;
+    }
+  }
+
+  // Pass 3: if still nothing, extract sentences that sound like requirements
+  if (bullets.length === 0) {
+    for (const line of lines) {
+      if (/^(the system|user can|user should|it should|should be able|validate|verify|ensure|confirm|when.*then|the.*must|display|show|allow|prevent|enable)/i.test(line) && line.length > 15) {
+        bullets.push(line);
+      }
+      if (bullets.length >= 20) break;
+    }
+  }
+
+  return bullets.slice(0, 25);
 }
+
 
 
 // ─── Confluence fetch helper ──────────────────────────────────────────────────
@@ -499,8 +536,45 @@ async function fetchConfluenceForEpic(client, epicKey, onLog) {
 async function fetchStoriesParallel(client, stories, onLog) {
   const workerCount=Math.min(CONFIG.mcp.parallelWorkers,stories.length),results=new Array(stories.length);let idx=0;
   if(onLog)onLog(`▶ ${workerCount} parallel workers for ${stories.length} stories`,'info');
-  const worker=async wid=>{while(idx<stories.length){const i=idx++;if(i>=stories.length)return;const story=stories[i];if(onLog)onLog(`  worker-${wid} → fetching ${story.key}`);try{const d=await client.withRetry(`getIssue(${story.key})`,()=>client.getIssue(story.key,['summary','description','status','priority','assignee']),CONFIG.mcp.maxRetries,onLog);const dt=adfToPlainText(d.fields.description);results[i]={id:d.key,title:d.fields.summary,desc:dt.slice(0,3000),ac:extractAcceptanceCriteria(dt)};if(onLog)onLog(`  worker-${wid} ✓ ${story.key} (${i+1}/${stories.length})`,'ok');}catch(err){if(onLog)onLog(`  worker-${wid} ✗ ${story.key} — ${err.message}`,'err');results[i]={id:story.key,title:(story.fields&&story.fields.summary)||story.key,desc:'(description unavailable)',ac:['Acceptance criteria unavailable']};}}};
-  await Promise.all(Array.from({length:workerCount},(_,i)=>worker(i+1)));
+
+  // Returns the full plain-text description. If very long (>6000 chars), keeps all of it
+  // by slicing into meaningful chunks — we never truncate mid-sentence arbitrarily.
+  function getFullDesc(plainText) {
+    if (!plainText) return '';
+    // No hard cap — return everything the story contains
+    // Jira descriptions are rarely >10k chars; Claude handles up to 200k tokens
+    return plainText.trim();
+  }
+
+  const worker=async wid=>{
+    while(idx<stories.length){
+      const i=idx++;
+      if(i>=stories.length)return;
+      const story=stories[i];
+      if(onLog)onLog(`  worker-${wid} → fetching ${story.key}`);
+      try{
+        const d=await client.withRetry(
+          `getIssue(${story.key})`,
+          ()=>client.getIssue(story.key,['summary','description','status','priority','assignee']),
+          CONFIG.mcp.maxRetries,onLog
+        );
+        const dt=adfToPlainText(d.fields.description);
+        const fullDesc = getFullDesc(dt);
+        results[i]={
+          id:   d.key,
+          title:d.fields.summary,
+          desc: fullDesc,     // full description — no extraction, no truncation
+          ac:   []            // not pre-extracted — Claude reads desc directly
+        };
+        if(onLog)onLog(`  worker-${wid} ✓ ${story.key} — ${fullDesc.length} chars (${i+1}/${stories.length})`,'ok');
+      }catch(err){
+        if(onLog)onLog(`  worker-${wid} ✗ ${story.key} — ${err.message}`,'err');
+        results[i]={id:story.key,title:(story.fields&&story.fields.summary)||story.key,desc:'(description unavailable)',ac:[]};
+      }
+    }
+  };
+
+  await Promise.all(Array.from({length:workerCount},(_,i)=>worker(i)));
   return results;
 }
 
@@ -749,7 +823,7 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       const roles = await extractEpicRoles(client, id, epic.fields, fieldMap);
       log(`✓ Roles — EM: ${roles.engineeringManager} | QA: ${roles.qaValidator||'—'} | Stakeholders: ${roles.stakeholders.length}`,'ok');
       epicsMeta.push({id,meta:{
-        key:epic.key,title:epic.fields.summary,description:dt.slice(0,800),
+        key:epic.key,title:epic.fields.summary,description:dt,
         status:(epic.fields.status&&epic.fields.status.name)||'Unknown',
         assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',
         reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',
@@ -782,9 +856,9 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
         epicEngineeringManager:e.meta.engineeringManager,
         epicQaValidator:e.meta.qaValidator,
         epicStakeholders:e.meta.stakeholders,
-        stories:e.stories.map(s=>({storyKey:s.id,storyTitle:s.title,description:s.desc,acceptanceCriteria:s.ac}))
+        stories:e.stories.map(s=>({storyKey:s.id,storyTitle:s.title,fullDescription:s.desc,acceptanceCriteria:s.ac}))
       })),
-      totals:{epics:allEpics.length,stories:totalStories,acceptanceCriteria:allEpics.reduce((a,e)=>a+e.stories.reduce((b,s)=>b+s.ac.length,0),0)}
+      totals:{epics:allEpics.length,stories:totalStories,acceptanceCriteria:allEpics.reduce((a,e)=>a+e.stories.reduce((b,s)=>b+(s.ac&&s.ac.length>0?s.ac.length:1),0),0)}
     };
     await savePlan(planId,req.user.email,projectName,release,epics,summary);
     await recordStatEvent(req.user.email,'testPlans');
@@ -827,150 +901,102 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 // Server-side TC prompt builder — same logic as client but runs on Render with real API key
 
 
+
 function buildServerTCPrompt(epicTitle, epicId, storyBlockJson, acList, confBlock) {
-  return `You are a Senior QA Architect generating test cases for the ClearlyRated automation team.
+  return `You are a Senior QA Architect generating automation-ready test cases for the ClearlyRated QA team.
 
 Epic: ${epicTitle} (${epicId})
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PART A: HOW TO WRITE TITLES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — READ AND UNDERSTAND THE STORIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Title format: "Validate [Component/Feature]: [behavior1], [behavior2], and [behavior3]"
-OR: "Validate [noun phrase describing all behaviors covered]"
+Each story below contains a full description that may include: Background, Requirements, Behavior sections, Edge Cases, Flag logic, QA Notes, or any other content.
 
-The title must:
-- Start with "Validate"
-- Describe the specific behaviors being tested — derived from the ACs, NOT from story names or IDs
-- If multiple behaviors: use comma-separated noun phrases (not full sentences)
-- If a named component exists: use colon after it — "Validate Suppression Engine: five conditions, AI retry, cadence change"
+READ THE ENTIRE fullDescription FOR EVERY STORY.
+Do not look for a specific "Acceptance Criteria" label.
+Derive all testable requirements from the full description — every stated behavior, rule, constraint, edge case, and expected outcome is a potential test case step.
 
-✅ "Validate Feature Flag activation, auto-enrollment of accounts and recipients, and NEW badge lifecycle"
-✅ "Validate Suppression Engine: all five conditions, independent audience-type behavior, AI retry up to 24 hours"
-✅ "Validate Settings Drawer frequency configuration, per-audience status summary, and save/error/unsaved-changes behavior"
-✅ "Validate role-based visibility and access control for Performance Digest card and Settings Drawer"
-❌ "Validate Story ENG-2941 acceptance criteria" — story ID in title
-❌ "Validate feature works correctly" — vague, not from ACs
-❌ "Validate NPS Digest" — just the epic name, not specific behaviors
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PART B: HOW TO WRITE PRECONDITIONS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Preconditions describe the exact data and account state needed before step 1. Semicolons between conditions.
-The preconditions handle login context — steps do NOT need to start with "Log in".
-For multi-scenario TCs, name the accounts: "Account A (5+ responses); Account B (<5 responses, fallback)"
-
-✅ "Firm A with flag OFF; Firm B with flag ON; Account B1 (Firm B) has 2 key contacts; no digest sent yet"
-✅ "Five test accounts each triggering one suppression condition; flag ON; Monthly cadence for all"
-✅ "Account with flag ON; User logged in as AM; Account never subscribed (State A); Client + Talent audience types active"
-❌ "User is logged in" — too vague
-❌ "Feature is deployed" — assumed, not a condition
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PART C: HOW TO WRITE STEPS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Each step = one action + one specific observable expected result.
-
-STEP PATTERNS (use these, in this order of frequency):
-1. "Verify [thing]: [additional context if needed]" → expected: exact UI state or copy
-2. "Click [button/element]" → expected: what happens on screen
-3. "Navigate to [exact page/section]" → expected: what the page shows
-4. "Log out and log in as [Role] at [Firm]; navigate to [page]" → expected: what that role sees
-5. "Account A ([description]): [what to do or verify]" → expected: behavior for that account
-6. "[Action] [thing]" → expected: result
-7. "Test Condition N ([description]): [setup or verify]" → expected: behavior
-
-CRITICAL RULES FOR STEPS:
-- Start with "Verify" for 60%+ of steps — it's the dominant step type
-- Do NOT start the first step with "Log in as..." — the preconditions handle login context
-  - UNLESS the test explicitly switches roles mid-TC (then use "Log out and log in as [Role]")
-- First step should be "Navigate to [exact screen]" or "Verify [initial state]"
-- For multi-scenario TCs: use "Account A ([desc]):", "Account B ([desc]):", "Recipient A:" as step prefixes
-- For role-testing TCs: use "Log out and log in as [Role]; navigate to [page]" between role switches
-- Quote exact UI copy in expected results using single quotes: 'Sends on the 3rd working day...'
-- Include exact states: 'State A', 'State B', '2 of 2 digests active', 'green dot', 'red dot'
-- Include counts and thresholds from ACs: '5+', '<5', '≤70 characters', 'up to 24 hours'
-- Expected results describe what the user sees — never "it works", "test passes", "behaves correctly"
-
-STEP COUNT: Target 12–18 steps. For complex multi-condition scenarios (like suppression engine or subject line ranks) up to 20 steps is acceptable.
-
-STEP LANGUAGE:
-- Plain English — non-technical stakeholders must understand every step
-- Never: "Assert:", "API call", "HTTP request", "DOM element", "DevTools", "XHR"
-- Use product terminology from the ACs: exact button names, section labels, notification copy
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PART D: GROUPING AND COVERAGE RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. Group ACs by functional area — ignore story boundaries. ACs from different stories belong in one TC if they test the same feature behavior in the same flow.
-
-2. Never split a TC by story. Split only when:
-   - A different user/role/account is required (one user identity per TC start to finish)
-   - The functional area is genuinely different (subscribe flow vs. email content vs. suppression engine)
-   - Adding more ACs would push step count over 20
-
-3. One user identity per TC: Account Manager, Admin, CR Employee, etc. Role-switching within a TC is allowed for role-visibility tests (using explicit login/logout steps).
-
-4. No duplicate assertions: every AC covered in exactly one TC. Track acRefs carefully.
-
-5. Multi-condition TCs: when testing N conditions (e.g., 5 suppression conditions), keep them in ONE TC using "Account A/B/C" or "Test Condition 1/2/3" step prefixes — do not split into 5 separate TCs.
-
-6. Coverage check: every AC in the list below must appear in exactly one acRefs array.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ACCEPTANCE CRITERIA — cover 100%, no gaps, no duplicates
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-${acList}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STORIES AND FULL ACCEPTANCE CRITERIA
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Story data:
 
 ${storyBlockJson}
 ${confBlock}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PROCESS — follow these steps before writing
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — IDENTIFY WHAT NEEDS TO BE TESTED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Step 1: Read all ACs. Group them by functional area (not by story).
-Step 2: Identify which groups need a different user → those become separate TCs.
-Step 3: For multi-condition groups (e.g., 5 suppression states): keep them in one TC with Account A/B/C or Condition 1/2/3 structure.
-Step 4: For each TC, write a title from the primary behaviors (NOT story names).
-Step 5: Write steps — "Verify [thing]" is the dominant format. Jump straight to the feature; preconditions handle the setup.
-Step 6: Check: every AC has exactly one acRef entry. Fill any gap.
+After reading all stories, identify the distinct functional behaviors to test. Group them by:
+- What the user can see or do
+- System behaviors that produce a visible result
+- Conditional logic (flag ON vs OFF, role A vs role B, state A vs state B)
+- Error states, edge cases, and recovery flows
 
-Expected output: 4–8 test cases for a typical epic.
+Pre-identified requirements (may be incomplete — supplement with what you read in the full descriptions above):
+${acList}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT — return ONLY this JSON, nothing else
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — TEST CASE GROUPING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GROUP INTO ONE TEST CASE when:
+- Steps test the same functional behavior in the same user flow
+- Same user account, same screen, naturally sequential
+- Example: "card appears → click Subscribe → drawer opens → defaults set → key contacts populated → save → State B" → ONE test case
+
+CREATE A NEW TEST CASE when:
+- A different user identity is needed (different role, different firm, different account)
+- A genuinely different functional area (flag behavior vs. drawer settings vs. recipient management)
+- Testing multiple conditions (Account A with X, Account B with Y) — use "Account A:", "Account B:" step prefixes
+
+Never split test cases along story boundaries.
+Expected output: 4–8 test cases for this epic.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — HOW TO WRITE EACH TEST CASE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TITLE: "Validate [component/behavior]: [all flows covered]"
+— Derived from WHAT IS BEING TESTED, never from story names or IDs
+— ✅ "Validate Feature Flag activation, auto-enrollment of accounts, and NEW badge lifecycle"
+— ✅ "Validate Performance Digest card State A to State B subscription flow"
+— ❌ "Validate ENG-2942 requirements"
+
+PRECONDITIONS: One sentence with semicolons — exact data state needed before step 1
+— ✅ "Firm A with flag OFF; Firm B with flag ON; Account B1 has 2 key contacts; no digest sent yet"
+— ❌ "User is logged in"
+
+CREDENTIALS: Exact role — "Account Manager", "CR Employee", "Admin", "Various roles"
+
+STEPS (12–18 per test case, max 20 for complex multi-condition scenarios):
+— "Verify" starts most steps — it is the dominant pattern
+— First step: "Navigate to [exact page]." — NOT "Log in as..."
+— Full navigation context: "Navigate to Insights > Overview for Account B1 (Firm B, flag ON)"
+— For role switches: "Log out and log in as [Role]; navigate to [page]."
+— For multi-account conditions: "Account A (flag ON): [verify/action]"
+— Expected results quote exact UI copy from the story description: 'Settings saved.', 'Key Contact', 'State B'
+— Expected results describe counts, colors, states: 'green dot', '2 of 2 digests active', 'NEW badge'
+— Plain English — no "Assert:", "API call", "HTTP", "DOM", "DevTools"
+— Never vague: "it works", "is visible", "is correct"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT — return ONLY valid JSON, nothing else
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [
   {
-    "title": "Validate [component/feature]: [behavior1], [behavior2], and [behavior3]",
+    "title": "Validate [component]: [behaviors covered]",
     "category": "Positive Flows",
-    "preconditions": "[data state]; [account state]; [conditions]",
-    "credentials": "[exact role — e.g. Account Manager, Admin, CR Employee, Various roles]",
+    "preconditions": "[exact data state for this test case]",
+    "credentials": "[exact role]",
     "storyIds": ["${epicId}"],
-    "acRefs": ["storyId/AC1", "storyId/AC2"],
+    "acRefs": [],
     "steps": [
-      {
-        "action": "Navigate to [exact page/section].",
-        "expectedResult": "[What appears on screen — specific elements, states, copy]"
-      },
-      {
-        "action": "Verify [thing being checked].",
-        "expectedResult": "[Exact UI state — quote copy in single quotes: 'exact text here']"
-      }
+      { "action": "Navigate to [exact screen].", "expectedResult": "[what appears on screen]" },
+      { "action": "Verify [specific thing].", "expectedResult": "[exact observable result, quoted copy]" }
     ]
   }
-]`;
-}
+]`;}
 
 
 
@@ -997,7 +1023,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority']),CONFIG.mcp.maxRetries,log);
       const dt=adfToPlainText(epic.fields.description);
       const roles=await extractEpicRoles(client,id,epic.fields,fieldMap);
-      epicsMeta.push({id,meta:{key:epic.key,title:epic.fields.summary,description:dt.slice(0,800),assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',engineeringManager:roles.engineeringManager,qaValidator:roles.qaValidator,stakeholders:roles.stakeholders}});
+      epicsMeta.push({id,meta:{key:epic.key,title:epic.fields.summary,description:dt,assignee:(epic.fields.assignee&&epic.fields.assignee.displayName)||'Unassigned',reporter:(epic.fields.reporter&&epic.fields.reporter.displayName)||'Unknown',engineeringManager:roles.engineeringManager,qaValidator:roles.qaValidator,stakeholders:roles.stakeholders}});
       log(`✓ Epic loaded: ${epicsMeta[epicsMeta.length-1].meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);
     }
     phase(1,'done',`${epics.length} epics fetched`);
@@ -1081,13 +1107,31 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
         // Build AC inventory
         const acInventory = [];
         stories.forEach((s,si) => {
-          (s.ac||[]).forEach((ac,ai) => {
-            acInventory.push({ ref: `${s.id}/AC${ai+1}`, story: s.id, title: s.title||'', ac });
-          });
+          // Include both extracted ACs and full description — Claude reads ALL of it
+          const storyReqs = (s.ac||[]).filter(a => a !== 'Acceptance criteria unavailable');
+          if (storyReqs.length > 0) {
+            storyReqs.forEach((ac,ai) => {
+              acInventory.push({ ref: `${s.id}/AC${ai+1}`, story: s.id, title: s.title||'', ac });
+            });
+          }
         });
-        const acList = acInventory.map((a,i) => `${i+1}. [${a.ref}] ${a.ac}`).join('\n');
+        // Log what we found
+        if (acInventory.length > 0) {
+          log(`  📋 ${acInventory.length} extracted ACs across ${stories.length} stories`, 'ok');
+          acInventory.slice(0, 5).forEach(a => log(`     [${a.ref}] ${a.ac.slice(0,70)}`, 'ok'));
+          if (acInventory.length > 5) log(`     ... and ${acInventory.length - 5} more`, 'ok');
+        } else {
+          log(`  📋 No structured ACs found — Claude will derive requirements from full story descriptions`, 'warn');
+        }
+        const acList = acInventory.length > 0
+          ? acInventory.map((a,i) => `${i+1}. [${a.ref}] ${a.ac}`).join('\n')
+          : stories.map(s => `Story ${s.id} — ${s.title}: see full description below`).join('\n');
+
         const storyBlock = JSON.stringify(stories.map(s => ({
-          id: s.id, title: s.title||'', desc: (s.desc||'').slice(0,600), ac: (s.ac||[]).slice(0,40)
+          id: s.id,
+          title: s.title||'',
+          fullDescription: (s.desc||'').slice(0,3000),   // full description — no pre-filtering
+          extractedACs: (s.ac||[]).filter(a => a !== 'Acceptance criteria unavailable').slice(0,40)
         })), null, 2);
         const confBlock = epic.confluenceContent ? `\n\nConfluence notes:\n${epic.confluenceContent.slice(0,1500)}` : '';
         const prompt = buildServerTCPrompt(epic.meta?.title || epic.id, epic.id, storyBlock, acList, confBlock);
