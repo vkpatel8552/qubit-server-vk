@@ -523,57 +523,8 @@ function adfToPlainText(adf) {
 
 // Extract ALL meaningful content from a story description as requirement lines.
 // NO heading filtering — every bullet, table row, and meaningful sentence is a requirement.
-function extractAcceptanceCriteria(descText) {
-  if (!descText) return [];
-  const results = [];
-  const seen = new Set();
+// extractAcceptanceCriteria defined below
 
-  function addLine(line) {
-    line = line.trim();
-    // Remove ADF artifacts and leading markers
-    line = line.replace(/^[•\-\*]\s*/, '').replace(/^\d+[\.\)]\s*/, '').trim();
-    if (line.length < 8) return;          // too short to be meaningful
-    if (seen.has(line.toLowerCase())) return; // deduplicate
-    // Skip pure section headings (short lines without verbs or details)
-    if (line.length < 20 && !/\b(is|are|should|must|will|can|do|does|has|have|when|if|then|not|no|all|any|the)\b/i.test(line)) return;
-    seen.add(line.toLowerCase());
-    results.push(line);
-  }
-
-  const lines = descText.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    // Bullet point or numbered item
-    const bulletMatch = trimmed.match(/^[•\-\*]\s*(.{8,})/) || trimmed.match(/^\d+[\.\)]\s*(.{8,})/);
-    if (bulletMatch) {
-      addLine(bulletMatch[1]);
-      continue;
-    }
-
-    // Table row (pipe-separated) — each cell is a requirement
-    if (trimmed.includes(' | ')) {
-      const cells = trimmed.split(' | ').map(c => c.trim()).filter(c => c.length > 8);
-      // Skip pure header rows (all short words or "---")
-      if (cells.some(c => c.includes(' ') && !c.startsWith('-'))) {
-        cells.forEach(cell => addLine(cell));
-      }
-      continue;
-    }
-
-    // Paragraph sentence (skip short headings, keep meaningful sentences)
-    if (trimmed.length > 30 && !trimmed.startsWith('#') && !trimmed.startsWith('---')) {
-      // Split long paragraphs into sentences
-      const sentences = trimmed.split(/(?<=[.!?])\s+/);
-      for (const sentence of sentences) {
-        if (sentence.length > 20) addLine(sentence);
-      }
-    }
-  }
-
-  return results.slice(0, 40); // max 40 requirements per story
-}
 
 
 function extractAcceptanceCriteria(descText) {
@@ -1250,7 +1201,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const send  = (event,data) => { try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){} };
   const log   = (msg,level='info') => send('log',{msg,level,ts:Date.now()});
   const phase = (idx,state,sub)   => send('phase',{idx,state,sub});
-  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },15000);
+  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },5000);
 
   // ─── PHASES ────────────────────────────────────────────────────────────────
   // 0: Authenticate   1: Fetch Epics   2: Find Stories
@@ -1366,6 +1317,9 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
           const batchStories = batches[bi];
           const batchIds = batchStories.map(s=>s.id).join(', ');
           log(`  Batch ${bi+1}/${batches.length}: ${batchIds}`,'info');
+          // Send progress so client timer keeps running during Claude API call
+          const pct = Math.round(((bi) / batches.length) * 40 + 55); // 55-95% range for phase 5
+          send('progress',{pct, msg:`Batch ${bi+1}/${batches.length} — calling Claude...`});
 
           const prompt = buildServerTCPrompt(
             epic.title||epic.id,
@@ -1438,6 +1392,8 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
               });
             });
             log(`  ✓ Batch ${bi+1}: ${cases.length} test case(s)`,'ok');
+            const donePct = Math.round(((bi+1) / batches.length) * 40 + 55);
+            send('progress',{pct: donePct, msg:`Batch ${bi+1}/${batches.length} complete — ${generatedCases.length} cases so far`});
 
           } catch(aiErr) {
             log(`  ✗ Batch ${bi+1} failed: ${aiErr.message}`,'err');
@@ -1446,15 +1402,55 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       } // end epic loop
     }
 
-    phase(5,'done',`${generatedCases.length} test cases generated`);
-    log(`╚═══ COMPLETE: ${generatedCases.length} test cases ═══`,'ok');
+    // ─── Post-process: merge test cases where same credentials + overlapping stories ─
+    // Batches can produce TCs that naturally belong together (same user flow split across batch boundary)
+    // We merge by: same credentials + same category + combined steps ≤ 18
+    const mergedCases = [];
+    const used = new Set();
+    for(let i=0; i<generatedCases.length; i++){
+      if(used.has(i)) continue;
+      const tc = {...generatedCases[i]};
+      for(let j=i+1; j<generatedCases.length; j++){
+        if(used.has(j)) continue;
+        const other = generatedCases[j];
+        const sameCreds    = tc.credentials === other.credentials;
+        const sameCategory = tc.category === other.category;
+        const combinedSteps = tc.steps.length + other.steps.length;
+        // Merge if: same user, same category, combined steps ≤ 18, AND titles are related
+        // (share a key noun — indicates same feature area)
+        const tcWords    = new Set(tc.title.toLowerCase().split(/\W+/).filter(w=>w.length>5));
+        const otherWords = other.title.toLowerCase().split(/\W+/).filter(w=>w.length>5);
+        const sharedWords = otherWords.filter(w=>tcWords.has(w)).length;
+        if(sameCreds && sameCategory && combinedSteps <= 18 && sharedWords >= 2){
+          // Merge: combine steps, merge storyIds, update title to cover both
+          tc.steps = [...tc.steps, ...other.steps].slice(0, 18);
+          tc.stories = [...new Set([...tc.stories, ...other.stories])];
+          tc.acRefs  = [...new Set([...tc.acRefs,  ...other.acRefs])];
+          // Keep the longer/more descriptive title
+          if(other.title.length > tc.title.length) tc.title = other.title;
+          used.add(j);
+          log(`  Merged: "${other.title.slice(0,50)}..." into "${tc.title.slice(0,50)}..."`, 'ok');
+        }
+      }
+      mergedCases.push(tc);
+      used.add(i);
+    }
+    // Re-number after merging
+    mergedCases.forEach((tc, i) => { tc.caseId = `${prefix}-${String(i+1).padStart(3,'0')}`; });
+    const finalCount = mergedCases.length;
+    if(finalCount < generatedCases.length){
+      log(`  Merged ${generatedCases.length} → ${finalCount} test cases`, 'ok');
+    }
+
+    phase(5,'done',`${finalCount} test cases generated`);
+    log(`╚═══ COMPLETE: ${finalCount} test cases ═══`,'ok');
     send('complete',{
       projectName, release, epics, prefix,
       allEpics,
       totalStories,
       generatedBy:    req.user.fullName,
       site:           jira.siteUrl,
-      generatedCases
+      generatedCases: mergedCases
     });
 
   } catch(err) {
