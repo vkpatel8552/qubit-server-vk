@@ -523,58 +523,6 @@ function adfToPlainText(adf) {
 
 // Extract ALL meaningful content from a story description as requirement lines.
 // NO heading filtering — every bullet, table row, and meaningful sentence is a requirement.
-function extractAcceptanceCriteria(descText) {
-  if (!descText) return [];
-  const results = [];
-  const seen = new Set();
-
-  function addLine(line) {
-    line = line.trim();
-    // Remove ADF artifacts and leading markers
-    line = line.replace(/^[•\-\*]\s*/, '').replace(/^\d+[\.\)]\s*/, '').trim();
-    if (line.length < 8) return;          // too short to be meaningful
-    if (seen.has(line.toLowerCase())) return; // deduplicate
-    // Skip pure section headings (short lines without verbs or details)
-    if (line.length < 20 && !/\b(is|are|should|must|will|can|do|does|has|have|when|if|then|not|no|all|any|the)\b/i.test(line)) return;
-    seen.add(line.toLowerCase());
-    results.push(line);
-  }
-
-  const lines = descText.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    // Bullet point or numbered item
-    const bulletMatch = trimmed.match(/^[•\-\*]\s*(.{8,})/) || trimmed.match(/^\d+[\.\)]\s*(.{8,})/);
-    if (bulletMatch) {
-      addLine(bulletMatch[1]);
-      continue;
-    }
-
-    // Table row (pipe-separated) — each cell is a requirement
-    if (trimmed.includes(' | ')) {
-      const cells = trimmed.split(' | ').map(c => c.trim()).filter(c => c.length > 8);
-      // Skip pure header rows (all short words or "---")
-      if (cells.some(c => c.includes(' ') && !c.startsWith('-'))) {
-        cells.forEach(cell => addLine(cell));
-      }
-      continue;
-    }
-
-    // Paragraph sentence (skip short headings, keep meaningful sentences)
-    if (trimmed.length > 30 && !trimmed.startsWith('#') && !trimmed.startsWith('---')) {
-      // Split long paragraphs into sentences
-      const sentences = trimmed.split(/(?<=[.!?])\s+/);
-      for (const sentence of sentences) {
-        if (sentence.length > 20) addLine(sentence);
-      }
-    }
-  }
-
-  return results.slice(0, 40); // max 40 requirements per story
-}
-
 
 function extractAcceptanceCriteria(descText) {
   if (!descText) return [];
@@ -929,7 +877,7 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
   const send=(event,data)=>{try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){}};
   const log=(msg,level='info')=>send('log',{msg,level,ts:Date.now()});
   const phase=(idx,state,sub)=>send('phase',{idx,state,sub});
-  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},15000);
+  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},5000);
   try {
     log(`╔═══ TEST PLAN GENERATION STARTED ═══`);
     log(`Project: ${projectName} · Epics: ${epics.join(', ')}`);
@@ -1250,7 +1198,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const send  = (event,data) => { try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){} };
   const log   = (msg,level='info') => send('log',{msg,level,ts:Date.now()});
   const phase = (idx,state,sub)   => send('phase',{idx,state,sub});
-  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },15000);
+  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },5000);
 
   // ─── PHASES ────────────────────────────────────────────────────────────────
   // 0: Authenticate   1: Fetch Epics   2: Find Stories
@@ -1331,20 +1279,21 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     }
     phase(4,'done',`Confluence: ${Object.keys(confluenceByEpic).length} of ${epicsMeta.length} found`);
 
-    // ─── Phase 5: Generate test cases via Claude AI (parallel workers) ─────────
-    // Each story runs as its own Claude call. All fire simultaneously (up to WORKER_CONCURRENCY).
-    // 14 stories × 25s sequential = 350s → ~30s parallel. No more timeouts.
+    // ─── Phase 5: Generate test cases via Claude AI (rate-limit-aware parallel) ──
+    // Rate limit: 10,000 input tokens/min. Each story ~2,600 tokens.
+    // WORKER_CONCURRENCY=3 → 7,800 tokens/min, safely under limit.
+    // Failed workers retry with exponential backoff on 429.
     phase(5,'active','Calling Claude AI (parallel)...');
     log(`╔═══ AI TEST CASE GENERATION — PARALLEL ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
-    const WORKER_CONCURRENCY = 5; // max simultaneous Anthropic API calls
+    const WORKER_CONCURRENCY = 3; // 3 × ~2600 tokens = ~7800 tokens/min < 10k limit
 
     if(!ANTHROPIC_KEY){
       log(`✗ ANTHROPIC_API_KEY not set — add it in Render → Environment`,'err');
     } else {
 
-      // Build flat job list across all epics
+      // Build flat job list across all epics (one job = one story)
       const jobs = [];
       for(const epic of allEpics){
         const stories = epic.stories||[];
@@ -1352,87 +1301,105 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
         const confData = confluenceByEpic[epic.id]||null;
         log(`  Epic: ${epic.title||epic.id} — ${stories.length} stories queued`,'ok');
         stories.forEach((story,si) => {
-          jobs.push({epic, story, si,
+          jobs.push({
+            epic, story, si,
             confContent: si===0&&confData ? confData.content : null,
             confTitle:   si===0&&confData ? confData.title   : null
           });
         });
       }
-      log(`  ${jobs.length} total stories — ${WORKER_CONCURRENCY} parallel workers`,'ok');
-      send('progress',{pct:57, msg:`Launching ${jobs.length} parallel AI workers...`});
+      log(`  ${jobs.length} stories — ${WORKER_CONCURRENCY} parallel workers (rate-limited)`,'ok');
+      send('progress',{pct:57, msg:`${jobs.length} stories queued, ${WORKER_CONCURRENCY} parallel workers...`});
 
-      // Per-story worker: builds prompt → calls Claude → parses JSON
+      // Single-story Claude call with 429 retry + exponential backoff
       const processStory = async (job, idx) => {
         const {epic, story, confContent, confTitle} = job;
         const label = `${story.id} (${idx+1}/${jobs.length})`;
-        log(`  → Worker ${idx+1}: ${story.id}`,'info');
 
         const prompt = buildServerTCPrompt(
           epic.title||epic.id, epic.id,
           [story], confContent, confTitle
         );
 
-        const ctrl = new AbortController();
-        const tout = setTimeout(()=>ctrl.abort(), 90000);
+        const callClaude = async (attempt=0) => {
+          if(attempt > 0){
+            const wait = Math.min(30000, 5000 * Math.pow(2, attempt-1)); // 5s,10s,20s
+            log(`  ⏳ ${label}: waiting ${wait/1000}s before retry ${attempt}/3`,'warn');
+            await new Promise(r=>setTimeout(r,wait));
+          }
+          const ctrl = new AbortController();
+          const tout = setTimeout(()=>ctrl.abort(), 90000);
+          try {
+            const resp = await fetch('https://api.anthropic.com/v1/messages', {
+              method:'POST', signal:ctrl.signal,
+              headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
+              body: JSON.stringify({
+                model:'claude-sonnet-4-6', max_tokens:8192,
+                system:'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ]. Generate maximum 5 test cases. Be concise.',
+                messages:[{role:'user',content:prompt}]
+              })
+            });
+            clearTimeout(tout);
+            if(resp.status===429){
+              if(attempt<3) return callClaude(attempt+1);
+              throw new Error(`Rate limit (429) after 3 retries — reduce concurrency or wait`);
+            }
+            const data = await resp.json();
+            if(!resp.ok) throw new Error(`API ${resp.status}: ${data.error?.message||JSON.stringify(data.error)}`);
+            return data;
+          } catch(e){ clearTimeout(tout); throw e; }
+        };
+
         try {
-          const resp = await fetch('https://api.anthropic.com/v1/messages', {
-            method:'POST', signal:ctrl.signal,
-            headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
-            body: JSON.stringify({
-              model:'claude-sonnet-4-6', max_tokens:8192,
-              system:'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ]. Generate maximum 5 test cases. Be concise.',
-              messages:[{role:'user',content:prompt}]
-            })
-          });
-          clearTimeout(tout);
-          const data = await resp.json();
-          if(!resp.ok) throw new Error(`API ${resp.status}: ${data.error?.message||JSON.stringify(data.error)}`);
+          log(`  → Worker ${idx+1}: ${story.id} — ${story.title.slice(0,40)}`,'info');
+          const data = await callClaude();
           const raw = (data.content?.[0]?.text||'').trim();
           log(`  ✓ ${label}: ${raw.length} chars | ${data.usage?.input_tokens||'?'}in/${data.usage?.output_tokens||'?'}out`,'ok');
           let clean = raw.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
           const j0=clean.indexOf('['), j1=clean.lastIndexOf(']');
-          if(j0===-1||j1<j0) throw new Error(`No JSON. Preview: ${raw.slice(0,150)}`);
+          if(j0===-1||j1<j0) throw new Error(`No JSON. Preview: ${raw.slice(0,120)}`);
           let cases;
           try { cases=JSON.parse(clean.slice(j0,j1+1)); }
           catch(e){
             const lc=clean.slice(j0,j1+1).lastIndexOf('},');
             cases = lc>0 ? JSON.parse(clean.slice(j0,j0+lc+1)+']') : [];
           }
-          return {story, cases: Array.isArray(cases)?cases:[], error:null};
+          return {story, cases:Array.isArray(cases)?cases:[], error:null};
         } catch(err) {
-          clearTimeout(tout);
           log(`  ✗ ${label}: ${err.name==='AbortError'?'timeout 90s':err.message}`,'err');
           return {story, cases:[], error:err.message};
         }
       };
 
-      // Concurrency pool: keep WORKER_CONCURRENCY calls active at all times
+      // Concurrency pool — always keep WORKER_CONCURRENCY calls running
       const results = new Array(jobs.length);
       let nextJob=0, completed=0;
-      const pool = [];
-      const kickNext = () => {
-        while(pool.length < WORKER_CONCURRENCY && nextJob < jobs.length){
+      const active = [];
+
+      const spawnNext = () => {
+        while(active.length < WORKER_CONCURRENCY && nextJob < jobs.length){
           const idx = nextJob++;
           const p = processStory(jobs[idx], idx).then(r => {
-            results[idx]=r;
-            pool.splice(pool.indexOf(p),1);
+            active.splice(active.indexOf(p), 1);
+            results[idx] = r;
             completed++;
-            const pct=Math.round(57+(completed/jobs.length)*38);
-            const soFar=results.filter(r=>r&&r.cases.length).reduce((n,r)=>n+r.cases.length,0);
+            const pct = Math.round(57+(completed/jobs.length)*38);
+            const soFar = results.filter(r=>r&&r.cases.length).reduce((n,r)=>n+r.cases.length,0);
             send('progress',{pct, msg:`${completed}/${jobs.length} done — ${soFar} TCs`});
-            kickNext();
+            spawnNext();
           });
-          pool.push(p);
+          active.push(p);
         }
       };
-      kickNext();
-      while(pool.length>0) await Promise.race(pool);
 
-      // Collect results in original story order
-      let caseNum=1;
-      results.forEach(r=>{
+      spawnNext();
+      while(active.length > 0) await Promise.race(active);
+
+      // Collect results in original story order, assign sequential case IDs
+      let caseNum = 1;
+      results.forEach(r => {
         if(!r||!r.cases.length) return;
-        r.cases.forEach(tc=>{
+        r.cases.forEach(tc => {
           generatedCases.push({
             caseId:`${prefix}-${String(caseNum++).padStart(3,'0')}`,
             title:(tc.title||`Validate ${r.story.title||r.story.id}`).trim(),
@@ -1441,35 +1408,45 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
             credentials:tc.credentials||'Account Manager',
             stories:tc.storyIds||[r.story.id],
             acRefs:tc.acRefs||[],
-            steps:(tc.steps||[]).map((s,si)=>({stepNum:si+1,action:(s.action||'').trim(),expectedResult:(s.expectedResult||s.expected||'').trim()}))
+            steps:(tc.steps||[]).map((s,si)=>({
+              stepNum:si+1,
+              action:(s.action||'').trim(),
+              expectedResult:(s.expectedResult||s.expected||'').trim()
+            }))
           });
         });
       });
-      log(`  ${results.filter(r=>r&&!r.error).length}/${jobs.length} workers succeeded`,'ok');
+
+      const ok = results.filter(r=>r&&!r.error).length;
+      log(`  ${ok}/${jobs.length} workers succeeded — ${generatedCases.length} raw test cases`,'ok');
     }
 
-    // Merge TCs with same credentials + category + combined ≤18 steps + 2+ shared title words
+    // Smart functional merge: same user + same category + combined ≤16 steps + (same story OR 2+ shared title words)
     const merged=[], used=new Set();
     for(let i=0;i<generatedCases.length;i++){
       if(used.has(i)) continue;
-      const tc={...generatedCases[i],steps:[...generatedCases[i].steps]};
+      const tc={...generatedCases[i],steps:[...generatedCases[i].steps],stories:[...generatedCases[i].stories]};
       for(let j=i+1;j<generatedCases.length;j++){
         if(used.has(j)) continue;
         const o=generatedCases[j];
         if(tc.credentials!==o.credentials||tc.category!==o.category) continue;
-        if(tc.steps.length+o.steps.length>18) continue;
+        if(tc.steps.length+o.steps.length>16) continue;
+        const sameStory = tc.stories.some(s=>o.stories.includes(s));
         const wA=new Set(tc.title.toLowerCase().split(/\W+/).filter(w=>w.length>4));
-        if(o.title.toLowerCase().split(/\W+/).filter(w=>w.length>4&&wA.has(w)).length<2) continue;
-        tc.steps=[...tc.steps,...o.steps].slice(0,18);
+        const shared=o.title.toLowerCase().split(/\W+/).filter(w=>w.length>4&&wA.has(w)).length;
+        if(!sameStory && shared<2) continue;
+        tc.steps=[...tc.steps,...o.steps].slice(0,16);
         tc.stories=[...new Set([...tc.stories,...o.stories])];
         if(o.title.length>tc.title.length) tc.title=o.title;
         used.add(j);
+        log(`  Merged: "${o.title.slice(0,40)}..." into "${tc.title.slice(0,40)}..."`,'ok');
       }
       merged.push(tc); used.add(i);
     }
     merged.forEach((tc,i)=>{tc.caseId=`${prefix}-${String(i+1).padStart(3,'0')}`;});
-    if(merged.length<generatedCases.length) log(`  Merged ${generatedCases.length}→${merged.length} test cases`,'ok');
-    const finalCases=merged.length?merged:generatedCases;
+    if(merged.length<generatedCases.length)
+      log(`  Merged ${generatedCases.length}→${merged.length} test cases`,'ok');
+    const finalCases = merged.length ? merged : generatedCases;
 
     phase(5,'done',`${finalCases.length} test cases generated`);
     log(`╚═══ COMPLETE: ${finalCases.length} test cases ═══`,'ok');
