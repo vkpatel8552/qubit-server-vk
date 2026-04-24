@@ -523,9 +523,6 @@ function adfToPlainText(adf) {
 
 // Extract ALL meaningful content from a story description as requirement lines.
 // NO heading filtering — every bullet, table row, and meaningful sentence is a requirement.
-// extractAcceptanceCriteria defined below
-
-
 
 function extractAcceptanceCriteria(descText) {
   if (!descText) return [];
@@ -1289,7 +1286,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
-    const BATCH_SIZE = 2; // 2 stories per call — keeps output well under 16k token limit
+    const BATCH_SIZE = 2; // 2 stories per call
 
     if(!ANTHROPIC_KEY){
       log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
@@ -1317,9 +1314,6 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
           const batchStories = batches[bi];
           const batchIds = batchStories.map(s=>s.id).join(', ');
           log(`  Batch ${bi+1}/${batches.length}: ${batchIds}`,'info');
-          // Send progress so client timer keeps running during Claude API call
-          const pct = Math.round(((bi) / batches.length) * 40 + 55); // 55-95% range for phase 5
-          send('progress',{pct, msg:`Batch ${bi+1}/${batches.length} — calling Claude...`});
 
           const prompt = buildServerTCPrompt(
             epic.title||epic.id,
@@ -1331,16 +1325,26 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
           log(`  Prompt: ${prompt.length} chars | ${batchStories.length} stories`,'info');
 
           try {
-            const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
-              method:'POST',
-              headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
-              body: JSON.stringify({
-                model:      'claude-sonnet-4-6',
-                max_tokens: 16000,
-                system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
-                messages:   [{role:'user', content: prompt}]
-              })
-            });
+            // AbortController timeout — Render kills connections after 30s by default.
+            // Claude Sonnet can take 60-90s for large outputs. Use node-fetch timeout.
+            const fetchCtrl = new AbortController();
+            const fetchTimeout = setTimeout(() => fetchCtrl.abort(), 120000); // 120s
+            let aiResp;
+            try {
+              aiResp = await fetch('https://api.anthropic.com/v1/messages', {
+                method:'POST',
+                signal: fetchCtrl.signal,
+                headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
+                body: JSON.stringify({
+                  model:      'claude-sonnet-4-6',
+                  max_tokens: 16000,
+                  system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
+                  messages:   [{role:'user', content: prompt}]
+                })
+              });
+            } finally {
+              clearTimeout(fetchTimeout);
+            }
 
             const aiData = await aiResp.json();
             if(!aiResp.ok) throw new Error(`Anthropic API ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
@@ -1392,65 +1396,65 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
               });
             });
             log(`  ✓ Batch ${bi+1}: ${cases.length} test case(s)`,'ok');
-            const donePct = Math.round(((bi+1) / batches.length) * 40 + 55);
-            send('progress',{pct: donePct, msg:`Batch ${bi+1}/${batches.length} complete — ${generatedCases.length} cases so far`});
 
           } catch(aiErr) {
-            log(`  ✗ Batch ${bi+1} failed: ${aiErr.message}`,'err');
+            const isAbort = aiErr.name === 'AbortError';
+            log(`  ✗ Batch ${bi+1} failed: ${isAbort?'timeout (120s exceeded)':aiErr.message}`,'err');
+            // Retry once on network/timeout errors
+            if(isAbort || aiErr.message.includes('network') || aiErr.message.includes('socket')) {
+              log(`  ↻ Retrying batch ${bi+1}...`,'warn');
+              await new Promise(r=>setTimeout(r,3000)); // wait 3s before retry
+              try {
+                const retryCtrl = new AbortController();
+                const retryTimeout = setTimeout(()=>retryCtrl.abort(), 120000);
+                let retryResp;
+                try {
+                  retryResp = await fetch('https://api.anthropic.com/v1/messages', {
+                    method:'POST', signal: retryCtrl.signal,
+                    headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
+                    body: JSON.stringify({model:'claude-sonnet-4-6', max_tokens:16000,
+                      system:'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
+                      messages:[{role:'user', content: prompt}]})
+                  });
+                } finally { clearTimeout(retryTimeout); }
+                const retryData = await retryResp.json();
+                const retryRaw = (retryData.content?.[0]?.text||'').trim()
+                  .replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+                const rStart = retryRaw.indexOf('['), rEnd = retryRaw.lastIndexOf(']');
+                if(rStart!==-1 && rEnd>rStart) {
+                  const retryCases = JSON.parse(retryRaw.slice(rStart, rEnd+1));
+                  if(Array.isArray(retryCases) && retryCases.length) {
+                    retryCases.forEach(tc => generatedCases.push({
+                      caseId:`${prefix}-${String(++caseNum-1).padStart(3,'0')}`,
+                      title:(tc.title||'Validate '+epic.title).trim(),
+                      category:tc.category||'Positive Flows',
+                      preconditions:(tc.preconditions||'').replace(/[\n\r]+/g,' ').trim(),
+                      credentials:tc.credentials||'Account Manager',
+                      stories:tc.storyIds||batchStories.map(s=>s.id),
+                      acRefs:tc.acRefs||[],
+                      steps:(tc.steps||[]).map((s,si)=>({stepNum:si+1,action:(s.action||'').trim(),expectedResult:(s.expectedResult||s.expected||'').trim()}))
+                    }));
+                    log(`  ✓ Retry succeeded: ${retryCases.length} case(s)`,'ok');
+                  }
+                }
+              } catch(retryErr) {
+                log(`  ✗ Retry also failed: ${retryErr.message}`,'err');
+              }
+            }
           }
         } // end batch loop
       } // end epic loop
     }
 
-    // ─── Post-process: merge test cases where same credentials + overlapping stories ─
-    // Batches can produce TCs that naturally belong together (same user flow split across batch boundary)
-    // We merge by: same credentials + same category + combined steps ≤ 18
-    const mergedCases = [];
-    const used = new Set();
-    for(let i=0; i<generatedCases.length; i++){
-      if(used.has(i)) continue;
-      const tc = {...generatedCases[i]};
-      for(let j=i+1; j<generatedCases.length; j++){
-        if(used.has(j)) continue;
-        const other = generatedCases[j];
-        const sameCreds    = tc.credentials === other.credentials;
-        const sameCategory = tc.category === other.category;
-        const combinedSteps = tc.steps.length + other.steps.length;
-        // Merge if: same user, same category, combined steps ≤ 18, AND titles are related
-        // (share a key noun — indicates same feature area)
-        const tcWords    = new Set(tc.title.toLowerCase().split(/\W+/).filter(w=>w.length>5));
-        const otherWords = other.title.toLowerCase().split(/\W+/).filter(w=>w.length>5);
-        const sharedWords = otherWords.filter(w=>tcWords.has(w)).length;
-        if(sameCreds && sameCategory && combinedSteps <= 18 && sharedWords >= 2){
-          // Merge: combine steps, merge storyIds, update title to cover both
-          tc.steps = [...tc.steps, ...other.steps].slice(0, 18);
-          tc.stories = [...new Set([...tc.stories, ...other.stories])];
-          tc.acRefs  = [...new Set([...tc.acRefs,  ...other.acRefs])];
-          // Keep the longer/more descriptive title
-          if(other.title.length > tc.title.length) tc.title = other.title;
-          used.add(j);
-          log(`  Merged: "${other.title.slice(0,50)}..." into "${tc.title.slice(0,50)}..."`, 'ok');
-        }
-      }
-      mergedCases.push(tc);
-      used.add(i);
-    }
-    // Re-number after merging
-    mergedCases.forEach((tc, i) => { tc.caseId = `${prefix}-${String(i+1).padStart(3,'0')}`; });
-    const finalCount = mergedCases.length;
-    if(finalCount < generatedCases.length){
-      log(`  Merged ${generatedCases.length} → ${finalCount} test cases`, 'ok');
-    }
-
-    phase(5,'done',`${finalCount} test cases generated`);
-    log(`╚═══ COMPLETE: ${finalCount} test cases ═══`,'ok');
+    phase(5,'done',`${generatedCases.length} test cases generated`);
+    log(`╚═══ COMPLETE: ${generatedCases.length} test cases ═══`,'ok');
     send('complete',{
       projectName, release, epics, prefix,
       allEpics,
       totalStories,
       generatedBy:    req.user.fullName,
       site:           jira.siteUrl,
-      generatedCases: mergedCases
+      generatedCases
     });
 
   } catch(err) {
