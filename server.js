@@ -1418,28 +1418,32 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       });
 
       const ok = results.filter(r=>r&&!r.error).length;
+      const failedStories = results
+        .filter(r=>r&&r.error)
+        .map(r=>({id:r.story.id, title:r.story.title, error:r.error}));
+      if(failedStories.length){
+        log(`  ✗ ${failedStories.length} stories failed:`,'err');
+        failedStories.forEach(s=>log(`    • ${s.id}: ${s.error.slice(0,80)}`,'err'));
+      }
       log(`  ${ok}/${jobs.length} workers succeeded — ${generatedCases.length} raw test cases`,'ok');
     }
 
-    // Smart functional merge: same user + same category + combined ≤16 steps + (same story OR 2+ shared title words)
+    // Merge TCs: same credentials + category + combined ≤18 steps + 2+ shared title words
     const merged=[], used=new Set();
     for(let i=0;i<generatedCases.length;i++){
       if(used.has(i)) continue;
-      const tc={...generatedCases[i],steps:[...generatedCases[i].steps],stories:[...generatedCases[i].stories]};
+      const tc={...generatedCases[i],steps:[...generatedCases[i].steps]};
       for(let j=i+1;j<generatedCases.length;j++){
         if(used.has(j)) continue;
         const o=generatedCases[j];
         if(tc.credentials!==o.credentials||tc.category!==o.category) continue;
-        if(tc.steps.length+o.steps.length>16) continue;
-        const sameStory = tc.stories.some(s=>o.stories.includes(s));
+        if(tc.steps.length+o.steps.length>18) continue;
         const wA=new Set(tc.title.toLowerCase().split(/\W+/).filter(w=>w.length>4));
-        const shared=o.title.toLowerCase().split(/\W+/).filter(w=>w.length>4&&wA.has(w)).length;
-        if(!sameStory && shared<2) continue;
-        tc.steps=[...tc.steps,...o.steps].slice(0,16);
+        if(o.title.toLowerCase().split(/\W+/).filter(w=>w.length>4&&wA.has(w)).length<2) continue;
+        tc.steps=[...tc.steps,...o.steps].slice(0,18);
         tc.stories=[...new Set([...tc.stories,...o.stories])];
         if(o.title.length>tc.title.length) tc.title=o.title;
         used.add(j);
-        log(`  Merged: "${o.title.slice(0,40)}..." into "${tc.title.slice(0,40)}..."`,'ok');
       }
       merged.push(tc); used.add(i);
     }
@@ -1448,6 +1452,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       log(`  Merged ${generatedCases.length}→${merged.length} test cases`,'ok');
     const finalCases = merged.length ? merged : generatedCases;
 
+    const failedStoriesForClient = (typeof failedStories !== 'undefined') ? failedStories : [];
     phase(5,'done',`${finalCases.length} test cases generated`);
     log(`╚═══ COMPLETE: ${finalCases.length} test cases ═══`,'ok');
     send('complete',{
@@ -1456,6 +1461,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       totalStories,
       generatedBy:    req.user.fullName,
       site:           jira.siteUrl,
+      failedStories:  failedStoriesForClient,
       generatedCases: finalCases
     });
 
