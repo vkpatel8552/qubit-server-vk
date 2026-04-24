@@ -996,7 +996,7 @@ function buildStorySummary(stories) {
       `## Story ${i+1}: ${s.id} — ${s.title}`,
       ``,
       `### Description`,
-      s.desc || '(no description)',
+      (s.desc || '(no description)').slice(0, 800),
       ``,
       `### Requirements (${reqs.length})`,
       reqText
@@ -1279,190 +1279,136 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     }
     phase(4,'done',`Confluence: ${Object.keys(confluenceByEpic).length} of ${epicsMeta.length} found`);
 
-    // ─── Phase 5: Generate test cases via Claude AI (rate-limit-aware parallel) ──
-    // Rate limit: 10,000 input tokens/min. Each story ~2,600 tokens.
-    // WORKER_CONCURRENCY=3 → 7,800 tokens/min, safely under limit.
-    // Failed workers retry with exponential backoff on 429.
-    phase(5,'active','Calling Claude AI (parallel)...');
-    log(`╔═══ AI TEST CASE GENERATION — PARALLEL ═══`,'ok');
+    // ─── Phase 5: Generate test cases via Claude AI ───────────────────────────
+    // Stories are processed in batches of 3 to keep each prompt manageable.
+    // This avoids token truncation which was causing JSON parse failures.
+    phase(5,'active','Calling Claude AI...');
+    log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
-    const WORKER_CONCURRENCY = 3; // 3 × ~2600 tokens = ~7800 tokens/min < 10k limit
+    const BATCH_SIZE = 2; // 2 stories per call — keeps output well under token limit
 
     if(!ANTHROPIC_KEY){
-      log(`✗ ANTHROPIC_API_KEY not set — add it in Render → Environment`,'err');
+      log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
+      log(`  Add it: Render → service → Environment → ANTHROPIC_API_KEY = sk-ant-...`,'warn');
     } else {
+      let caseNum = 1;
 
-      // Build flat job list across all epics (one job = one story)
-      const jobs = [];
       for(const epic of allEpics){
-        const stories = epic.stories||[];
-        if(!stories.length) continue;
-        const confData = confluenceByEpic[epic.id]||null;
-        log(`  Epic: ${epic.title||epic.id} — ${stories.length} stories queued`,'ok');
-        stories.forEach((story,si) => {
-          jobs.push({
-            epic, story, si,
-            confContent: si===0&&confData ? confData.content : null,
-            confTitle:   si===0&&confData ? confData.title   : null
-          });
-        });
-      }
-      log(`  ${jobs.length} stories — ${WORKER_CONCURRENCY} parallel workers (rate-limited)`,'ok');
-      send('progress',{pct:57, msg:`${jobs.length} stories queued, ${WORKER_CONCURRENCY} parallel workers...`});
+        const allStories = epic.stories||[];
+        if(!allStories.length){ log(`  Skipping ${epic.id} — no stories`,'warn'); continue; }
 
-      // Single-story Claude call with 429 retry + exponential backoff
-      const processStory = async (job, idx) => {
-        const {epic, story, confContent, confTitle} = job;
-        const label = `${story.id} (${idx+1}/${jobs.length})`;
+        log(`  Epic: ${epic.title||epic.id} — ${allStories.length} stories, processing in batches of ${BATCH_SIZE}`,'ok');
 
-        const prompt = buildServerTCPrompt(
-          epic.title||epic.id, epic.id,
-          [story], confContent, confTitle
-        );
+        const confData    = confluenceByEpic[epic.id] || null;
+        const confContent = confData ? confData.content : null;
+        const confTitle   = confData ? confData.title   : null;
 
-        const callClaude = async (attempt=0) => {
-          if(attempt > 0){
-            const wait = Math.min(30000, 5000 * Math.pow(2, attempt-1)); // 5s,10s,20s
-            log(`  ⏳ ${label}: waiting ${wait/1000}s before retry ${attempt}/3`,'warn');
-            await new Promise(r=>setTimeout(r,wait));
-          }
-          const ctrl = new AbortController();
-          const tout = setTimeout(()=>ctrl.abort(), 90000);
+        // Split stories into batches
+        const batches = [];
+        for(let i=0; i<allStories.length; i+=BATCH_SIZE){
+          batches.push(allStories.slice(i, i+BATCH_SIZE));
+        }
+
+        for(let bi=0; bi<batches.length; bi++){
+          const batchStories = batches[bi];
+          const batchIds = batchStories.map(s=>s.id).join(', ');
+          log(`  Batch ${bi+1}/${batches.length}: ${batchIds}`,'info');
+
+          const prompt = buildServerTCPrompt(
+            epic.title||epic.id,
+            epic.id,
+            batchStories,
+            bi===0 ? confContent : null,  // only include Confluence in first batch
+            bi===0 ? confTitle   : null
+          );
+          log(`  Prompt: ${prompt.length} chars | ${batchStories.length} stories`,'info');
+
           try {
-            const resp = await fetch('https://api.anthropic.com/v1/messages', {
-              method:'POST', signal:ctrl.signal,
+            const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
+              method:'POST',
               headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
               body: JSON.stringify({
-                model:'claude-sonnet-4-6', max_tokens:8192,
-                system:'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ]. Generate maximum 5 test cases. Be concise.',
-                messages:[{role:'user',content:prompt}]
+                model:      'claude-sonnet-4-6',
+                max_tokens: 16000,
+                system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ]. Generate maximum 5 test cases. Be concise.',
+                messages:   [{role:'user', content: prompt}]
               })
             });
-            clearTimeout(tout);
-            if(resp.status===429){
-              if(attempt<3) return callClaude(attempt+1);
-              throw new Error(`Rate limit (429) after 3 retries — reduce concurrency or wait`);
+
+            const aiData = await aiResp.json();
+            if(!aiResp.ok) throw new Error(`Anthropic API ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
+
+            const rawText = (aiData.content?.[0]?.text || '').trim();
+            log(`  Response: ${rawText.length} chars | tokens: ${aiData.usage?.input_tokens||'?'} in / ${aiData.usage?.output_tokens||'?'} out`,'ok');
+
+            // Robust JSON extraction — handles any whitespace or trailing text
+            let cleanRaw = rawText.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+            const jsonStart = cleanRaw.indexOf('[');
+            const jsonEnd   = cleanRaw.lastIndexOf(']');
+            if(jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart){
+              throw new Error(`No JSON array found. Preview: ${rawText.slice(0,200)}`);
             }
-            const data = await resp.json();
-            if(!resp.ok) throw new Error(`API ${resp.status}: ${data.error?.message||JSON.stringify(data.error)}`);
-            return data;
-          } catch(e){ clearTimeout(tout); throw e; }
-        };
+            let jsonStr = cleanRaw.slice(jsonStart, jsonEnd+1);
+            // Attempt parse; if truncated, try to repair by closing open objects
+            let cases;
+            try {
+              cases = JSON.parse(jsonStr);
+            } catch(parseErr) {
+              // Response was truncated — try to recover partial cases
+              log(`  ⚠ JSON parse failed (likely truncation), attempting recovery...`,'warn');
+              // Find last complete object by splitting on },{ pattern
+              const lastComplete = jsonStr.lastIndexOf('},');
+              if(lastComplete > jsonStart) {
+                try { cases = JSON.parse(jsonStr.slice(0, lastComplete+1) + ']'); }
+                catch(e){ cases = []; }
+              } else { cases = []; }
+            }
 
-        try {
-          log(`  → Worker ${idx+1}: ${story.id} — ${story.title.slice(0,40)}`,'info');
-          const data = await callClaude();
-          const raw = (data.content?.[0]?.text||'').trim();
-          log(`  ✓ ${label}: ${raw.length} chars | ${data.usage?.input_tokens||'?'}in/${data.usage?.output_tokens||'?'}out`,'ok');
-          let clean = raw.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
-          const j0=clean.indexOf('['), j1=clean.lastIndexOf(']');
-          if(j0===-1||j1<j0) throw new Error(`No JSON. Preview: ${raw.slice(0,120)}`);
-          let cases;
-          try { cases=JSON.parse(clean.slice(j0,j1+1)); }
-          catch(e){
-            const lc=clean.slice(j0,j1+1).lastIndexOf('},');
-            cases = lc>0 ? JSON.parse(clean.slice(j0,j0+lc+1)+']') : [];
+            if(!Array.isArray(cases) || !cases.length){
+              throw new Error(`Empty or invalid array. Raw: ${rawText.slice(0,200)}`);
+            }
+
+            cases.forEach(tc => {
+              generatedCases.push({
+                caseId:        `${prefix}-${String(caseNum++).padStart(3,'0')}`,
+                title:         (tc.title||`Validate ${epic.title||epic.id}`).trim(),
+                category:      tc.category || 'Positive Flows',
+                preconditions: (tc.preconditions||'').replace(/\n+/g,' ').trim(),
+                credentials:   tc.credentials || 'Account Manager',
+                stories:       tc.storyIds || batchStories.map(s=>s.id),
+                acRefs:        tc.acRefs || [],
+                steps:         (tc.steps||[]).map((s,si) => ({
+                  stepNum:        si+1,
+                  action:         (s.action||'').trim(),
+                  expectedResult: (s.expectedResult||s.expected||'').trim()
+                }))
+              });
+            });
+            log(`  ✓ Batch ${bi+1}: ${cases.length} test case(s)`,'ok');
+
+          } catch(aiErr) {
+            const errMsg = aiErr.name==='AbortError' ? 'timeout (120s exceeded)' : aiErr.message;
+            log(`  ✗ Batch ${bi+1} (${batchIds}) failed: ${errMsg}`,'err');
+            batchStories.forEach(s => failedBatches.push({id:s.id, title:s.title, error:errMsg}));
           }
-          return {story, cases:Array.isArray(cases)?cases:[], error:null};
-        } catch(err) {
-          log(`  ✗ ${label}: ${err.name==='AbortError'?'timeout 90s':err.message}`,'err');
-          return {story, cases:[], error:err.message};
-        }
-      };
-
-      // Concurrency pool — always keep WORKER_CONCURRENCY calls running
-      const results = new Array(jobs.length);
-      let nextJob=0, completed=0;
-      const active = [];
-
-      const spawnNext = () => {
-        while(active.length < WORKER_CONCURRENCY && nextJob < jobs.length){
-          const idx = nextJob++;
-          const p = processStory(jobs[idx], idx).then(r => {
-            active.splice(active.indexOf(p), 1);
-            results[idx] = r;
-            completed++;
-            const pct = Math.round(57+(completed/jobs.length)*38);
-            const soFar = results.filter(r=>r&&r.cases.length).reduce((n,r)=>n+r.cases.length,0);
-            send('progress',{pct, msg:`${completed}/${jobs.length} done — ${soFar} TCs`});
-            spawnNext();
-          });
-          active.push(p);
-        }
-      };
-
-      spawnNext();
-      while(active.length > 0) await Promise.race(active);
-
-      // Collect results in original story order, assign sequential case IDs
-      let caseNum = 1;
-      results.forEach(r => {
-        if(!r||!r.cases.length) return;
-        r.cases.forEach(tc => {
-          generatedCases.push({
-            caseId:`${prefix}-${String(caseNum++).padStart(3,'0')}`,
-            title:(tc.title||`Validate ${r.story.title||r.story.id}`).trim(),
-            category:tc.category||'Positive Flows',
-            preconditions:(tc.preconditions||'').replace(/[\n\r]+/g,' ').trim(),
-            credentials:tc.credentials||'Account Manager',
-            stories:tc.storyIds||[r.story.id],
-            acRefs:tc.acRefs||[],
-            steps:(tc.steps||[]).map((s,si)=>({
-              stepNum:si+1,
-              action:(s.action||'').trim(),
-              expectedResult:(s.expectedResult||s.expected||'').trim()
-            }))
-          });
-        });
-      });
-
-      const ok = results.filter(r=>r&&!r.error).length;
-      const failedStories = results
-        .filter(r=>r&&r.error)
-        .map(r=>({id:r.story.id, title:r.story.title, error:r.error}));
-      if(failedStories.length){
-        log(`  ✗ ${failedStories.length} stories failed:`,'err');
-        failedStories.forEach(s=>log(`    • ${s.id}: ${s.error.slice(0,80)}`,'err'));
-      }
-      log(`  ${ok}/${jobs.length} workers succeeded — ${generatedCases.length} raw test cases`,'ok');
+        } // end batch loop
+      } // end epic loop
     }
 
-    // Merge TCs: same credentials + category + combined ≤18 steps + 2+ shared title words
-    const merged=[], used=new Set();
-    for(let i=0;i<generatedCases.length;i++){
-      if(used.has(i)) continue;
-      const tc={...generatedCases[i],steps:[...generatedCases[i].steps]};
-      for(let j=i+1;j<generatedCases.length;j++){
-        if(used.has(j)) continue;
-        const o=generatedCases[j];
-        if(tc.credentials!==o.credentials||tc.category!==o.category) continue;
-        if(tc.steps.length+o.steps.length>18) continue;
-        const wA=new Set(tc.title.toLowerCase().split(/\W+/).filter(w=>w.length>4));
-        if(o.title.toLowerCase().split(/\W+/).filter(w=>w.length>4&&wA.has(w)).length<2) continue;
-        tc.steps=[...tc.steps,...o.steps].slice(0,18);
-        tc.stories=[...new Set([...tc.stories,...o.stories])];
-        if(o.title.length>tc.title.length) tc.title=o.title;
-        used.add(j);
-      }
-      merged.push(tc); used.add(i);
-    }
-    merged.forEach((tc,i)=>{tc.caseId=`${prefix}-${String(i+1).padStart(3,'0')}`;});
-    if(merged.length<generatedCases.length)
-      log(`  Merged ${generatedCases.length}→${merged.length} test cases`,'ok');
-    const finalCases = merged.length ? merged : generatedCases;
-
-    const failedStoriesForClient = (typeof failedStories !== 'undefined') ? failedStories : [];
-    phase(5,'done',`${finalCases.length} test cases generated`);
-    log(`╚═══ COMPLETE: ${finalCases.length} test cases ═══`,'ok');
+    // Track which batches failed for client reporting
+    const failedBatches = [];
+    // (failedBatches populated in catch above per batch)
+    phase(5,'done',`${generatedCases.length} test cases generated`);
+    log(`╚═══ COMPLETE: ${generatedCases.length} test cases ═══`,'ok');
     send('complete',{
       projectName, release, epics, prefix,
       allEpics,
       totalStories,
       generatedBy:    req.user.fullName,
       site:           jira.siteUrl,
-      failedStories:  failedStoriesForClient,
-      generatedCases: finalCases
+      failedStories:  failedBatches,
+      generatedCases
     });
 
   } catch(err) {
