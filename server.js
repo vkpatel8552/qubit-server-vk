@@ -1286,7 +1286,8 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
-    const BATCH_SIZE = 2; // 2 stories per call — keeps output well under token limit
+    const failedBatches   = [];
+    const BATCH_SIZE = 2; // 2 stories per call
 
     if(!ANTHROPIC_KEY){
       log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
@@ -1329,7 +1330,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
               method:'POST',
               headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
               body: JSON.stringify({
-                model:      'claude-sonnet-4-6',
+                model:      'claude-haiku-4-5-20251001',
                 max_tokens: 16000,
                 system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ]. Generate maximum 5 test cases. Be concise.',
                 messages:   [{role:'user', content: prompt}]
@@ -1388,17 +1389,14 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
             log(`  ✓ Batch ${bi+1}: ${cases.length} test case(s)`,'ok');
 
           } catch(aiErr) {
-            const errMsg = aiErr.name==='AbortError' ? 'timeout (120s exceeded)' : aiErr.message;
-            log(`  ✗ Batch ${bi+1} (${batchIds}) failed: ${errMsg}`,'err');
-            batchStories.forEach(s => failedBatches.push({id:s.id, title:s.title, error:errMsg}));
+            const batchErr = aiErr.name==='AbortError'?'timeout (120s)':aiErr.message;
+            log(`  ✗ Batch ${bi+1} (${batchIds}): ${batchErr}`,'err');
+            batchStories.forEach(s=>failedBatches.push({id:s.id,title:(s.title||'').slice(0,50),error:batchErr}));
           }
         } // end batch loop
       } // end epic loop
     }
 
-    // Track which batches failed for client reporting
-    const failedBatches = [];
-    // (failedBatches populated in catch above per batch)
     phase(5,'done',`${generatedCases.length} test cases generated`);
     log(`╚═══ COMPLETE: ${generatedCases.length} test cases ═══`,'ok');
     send('complete',{
@@ -1448,7 +1446,7 @@ app.post('/api/testcase/ai', authMiddleware, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-6',
+        model:      'claude-haiku-4-5-20251001',
         max_tokens: 16000,
         messages:   [{ role: 'user', content: prompt }]
       })
