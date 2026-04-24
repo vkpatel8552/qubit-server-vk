@@ -523,6 +523,58 @@ function adfToPlainText(adf) {
 
 // Extract ALL meaningful content from a story description as requirement lines.
 // NO heading filtering — every bullet, table row, and meaningful sentence is a requirement.
+function extractAcceptanceCriteria(descText) {
+  if (!descText) return [];
+  const results = [];
+  const seen = new Set();
+
+  function addLine(line) {
+    line = line.trim();
+    // Remove ADF artifacts and leading markers
+    line = line.replace(/^[•\-\*]\s*/, '').replace(/^\d+[\.\)]\s*/, '').trim();
+    if (line.length < 8) return;          // too short to be meaningful
+    if (seen.has(line.toLowerCase())) return; // deduplicate
+    // Skip pure section headings (short lines without verbs or details)
+    if (line.length < 20 && !/\b(is|are|should|must|will|can|do|does|has|have|when|if|then|not|no|all|any|the)\b/i.test(line)) return;
+    seen.add(line.toLowerCase());
+    results.push(line);
+  }
+
+  const lines = descText.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // Bullet point or numbered item
+    const bulletMatch = trimmed.match(/^[•\-\*]\s*(.{8,})/) || trimmed.match(/^\d+[\.\)]\s*(.{8,})/);
+    if (bulletMatch) {
+      addLine(bulletMatch[1]);
+      continue;
+    }
+
+    // Table row (pipe-separated) — each cell is a requirement
+    if (trimmed.includes(' | ')) {
+      const cells = trimmed.split(' | ').map(c => c.trim()).filter(c => c.length > 8);
+      // Skip pure header rows (all short words or "---")
+      if (cells.some(c => c.includes(' ') && !c.startsWith('-'))) {
+        cells.forEach(cell => addLine(cell));
+      }
+      continue;
+    }
+
+    // Paragraph sentence (skip short headings, keep meaningful sentences)
+    if (trimmed.length > 30 && !trimmed.startsWith('#') && !trimmed.startsWith('---')) {
+      // Split long paragraphs into sentences
+      const sentences = trimmed.split(/(?<=[.!?])\s+/);
+      for (const sentence of sentences) {
+        if (sentence.length > 20) addLine(sentence);
+      }
+    }
+  }
+
+  return results.slice(0, 40); // max 40 requirements per story
+}
+
 
 function extractAcceptanceCriteria(descText) {
   if (!descText) return [];
@@ -605,6 +657,21 @@ async function fetchConfluenceForEpic(client, epicKey, onLog) {
     if (onLog) onLog(`⚠ Confluence fetch failed for ${epicKey}: ${e.message}`, 'warn');
     return null;
   }
+}
+
+
+// Skip stories whose title explicitly marks them as developer/technical tasks — not QA-relevant.
+// Only matches titles that LABEL themselves as dev/tech work via brackets, prefixes, or explicit phrases.
+// Does NOT filter on technical words that might appear in valid QA story titles.
+function isDevStory(title) {
+  var t = (title || '').trim();
+  // Bracket prefix patterns: [Technical Task], [Dev Task], [Backend], [Tech], [Developer], [Eng]
+  if (/^\[\s*(technical\s+task|tech\s+task|developer\s+task|dev\s+task|developer\s+story|dev\s+story|backend\s+task|backend\s+story|engineering\s+task|eng\s+task|tech\s+story|implementation\s+task|developer\s+implementation|technical\s+implementation|tech\s+implementation|infra\s+task|infrastructure\s+task|devops\s+task)\s*\]/i.test(t)) return true;
+  // Colon prefix patterns: "Technical Task: ", "Dev Task: ", "Developer: "
+  if (/^(technical\s+task|tech\s+task|developer\s+task|dev\s+task|backend\s+task|engineering\s+task|eng\s+task|tech\s+story|implementation\s+task|developer\s+implementation|developer\s+story|developer\s+only)\s*:/i.test(t)) return true;
+  // Title IS literally just a dev task phrase (no colon, whole title)
+  if (/^(technical\s+task|developer\s+task|dev\s+task|backend\s+task|engineering\s+task)$/i.test(t)) return true;
+  return false;
 }
 
 async function fetchStoriesParallel(client, stories, onLog) {
@@ -877,7 +944,7 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
   const send=(event,data)=>{try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){}};
   const log=(msg,level='info')=>send('log',{msg,level,ts:Date.now()});
   const phase=(idx,state,sub)=>send('phase',{idx,state,sub});
-  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},5000);
+  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},15000);
   try {
     log(`╔═══ TEST PLAN GENERATION STARTED ═══`);
     log(`Project: ${projectName} · Epics: ${epics.join(', ')}`);
@@ -996,7 +1063,7 @@ function buildStorySummary(stories) {
       `## Story ${i+1}: ${s.id} — ${s.title}`,
       ``,
       `### Description`,
-      (s.desc || '(no description)').slice(0, 800),
+      s.desc || '(no description)',
       ``,
       `### Requirements (${reqs.length})`,
       reqText
@@ -1198,7 +1265,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const send  = (event,data) => { try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){} };
   const log   = (msg,level='info') => send('log',{msg,level,ts:Date.now()});
   const phase = (idx,state,sub)   => send('phase',{idx,state,sub});
-  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },5000);
+  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },15000);
 
   // ─── PHASES ────────────────────────────────────────────────────────────────
   // 0: Authenticate   1: Fetch Epics   2: Find Stories
@@ -1286,8 +1353,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
-    const failedBatches   = [];
-    const BATCH_SIZE = 2; // 2 stories per call
+    const BATCH_SIZE = 3; // stories per Claude call
 
     if(!ANTHROPIC_KEY){
       log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
@@ -1330,9 +1396,9 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
               method:'POST',
               headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
               body: JSON.stringify({
-                model:      'claude-haiku-4-5-20251001',
-                max_tokens: 16000,
-                system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ]. Generate maximum 5 test cases. Be concise.',
+                model:      'claude-sonnet-4-6',
+                max_tokens: 8000,
+                system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
                 messages:   [{role:'user', content: prompt}]
               })
             });
@@ -1389,9 +1455,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
             log(`  ✓ Batch ${bi+1}: ${cases.length} test case(s)`,'ok');
 
           } catch(aiErr) {
-            const batchErr = aiErr.name==='AbortError'?'timeout (120s)':aiErr.message;
-            log(`  ✗ Batch ${bi+1} (${batchIds}): ${batchErr}`,'err');
-            batchStories.forEach(s=>failedBatches.push({id:s.id,title:(s.title||'').slice(0,50),error:batchErr}));
+            log(`  ✗ Batch ${bi+1} failed: ${aiErr.message}`,'err');
           }
         } // end batch loop
       } // end epic loop
@@ -1405,7 +1469,6 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
       totalStories,
       generatedBy:    req.user.fullName,
       site:           jira.siteUrl,
-      failedStories:  failedBatches,
       generatedCases
     });
 
@@ -1446,7 +1509,7 @@ app.post('/api/testcase/ai', authMiddleware, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model:      'claude-haiku-4-5-20251001',
+        model:      'claude-sonnet-4-6',
         max_tokens: 16000,
         messages:   [{ role: 'user', content: prompt }]
       })
