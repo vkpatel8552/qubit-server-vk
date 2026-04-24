@@ -523,58 +523,6 @@ function adfToPlainText(adf) {
 
 // Extract ALL meaningful content from a story description as requirement lines.
 // NO heading filtering — every bullet, table row, and meaningful sentence is a requirement.
-function extractAcceptanceCriteria(descText) {
-  if (!descText) return [];
-  const results = [];
-  const seen = new Set();
-
-  function addLine(line) {
-    line = line.trim();
-    // Remove ADF artifacts and leading markers
-    line = line.replace(/^[•\-\*]\s*/, '').replace(/^\d+[\.\)]\s*/, '').trim();
-    if (line.length < 8) return;          // too short to be meaningful
-    if (seen.has(line.toLowerCase())) return; // deduplicate
-    // Skip pure section headings (short lines without verbs or details)
-    if (line.length < 20 && !/\b(is|are|should|must|will|can|do|does|has|have|when|if|then|not|no|all|any|the)\b/i.test(line)) return;
-    seen.add(line.toLowerCase());
-    results.push(line);
-  }
-
-  const lines = descText.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    // Bullet point or numbered item
-    const bulletMatch = trimmed.match(/^[•\-\*]\s*(.{8,})/) || trimmed.match(/^\d+[\.\)]\s*(.{8,})/);
-    if (bulletMatch) {
-      addLine(bulletMatch[1]);
-      continue;
-    }
-
-    // Table row (pipe-separated) — each cell is a requirement
-    if (trimmed.includes(' | ')) {
-      const cells = trimmed.split(' | ').map(c => c.trim()).filter(c => c.length > 8);
-      // Skip pure header rows (all short words or "---")
-      if (cells.some(c => c.includes(' ') && !c.startsWith('-'))) {
-        cells.forEach(cell => addLine(cell));
-      }
-      continue;
-    }
-
-    // Paragraph sentence (skip short headings, keep meaningful sentences)
-    if (trimmed.length > 30 && !trimmed.startsWith('#') && !trimmed.startsWith('---')) {
-      // Split long paragraphs into sentences
-      const sentences = trimmed.split(/(?<=[.!?])\s+/);
-      for (const sentence of sentences) {
-        if (sentence.length > 20) addLine(sentence);
-      }
-    }
-  }
-
-  return results.slice(0, 40); // max 40 requirements per story
-}
-
 
 function extractAcceptanceCriteria(descText) {
   if (!descText) return [];
@@ -660,17 +608,14 @@ async function fetchConfluenceForEpic(client, epicKey, onLog) {
 }
 
 
-// Skip stories whose title explicitly marks them as developer/technical tasks — not QA-relevant.
-// Only matches titles that LABEL themselves as dev/tech work via brackets, prefixes, or explicit phrases.
-// Does NOT filter on technical words that might appear in valid QA story titles.
+// Skip stories whose title explicitly marks them as developer/technical tasks.
+// Matches bracket-prefixed labels like [Technical Task], [Dev Task], [Backend Task] etc.
 function isDevStory(title) {
   var t = (title || '').trim();
-  // Bracket prefix patterns: [Technical Task], [Dev Task], [Backend], [Tech], [Developer], [Eng]
-  if (/^\[\s*(technical\s+task|tech\s+task|developer\s+task|dev\s+task|developer\s+story|dev\s+story|backend\s+task|backend\s+story|engineering\s+task|eng\s+task|tech\s+story|implementation\s+task|developer\s+implementation|technical\s+implementation|tech\s+implementation|infra\s+task|infrastructure\s+task|devops\s+task)\s*\]/i.test(t)) return true;
-  // Colon prefix patterns: "Technical Task: ", "Dev Task: ", "Developer: "
-  if (/^(technical\s+task|tech\s+task|developer\s+task|dev\s+task|backend\s+task|engineering\s+task|eng\s+task|tech\s+story|implementation\s+task|developer\s+implementation|developer\s+story|developer\s+only)\s*:/i.test(t)) return true;
-  // Title IS literally just a dev task phrase (no colon, whole title)
-  if (/^(technical\s+task|developer\s+task|dev\s+task|backend\s+task|engineering\s+task)$/i.test(t)) return true;
+  // Bracket prefix: [Technical Task], [Dev Task], [Backend Task], [Eng Task], etc.
+  if (/^\[\s*(technical\s+task|tech\s+task|developer\s+task|dev\s+task|developer\s+story|dev\s+story|backend\s+task|backend\s+story|engineering\s+task|eng\s+task|tech\s+story|implementation\s+task|technical\s+implementation|tech\s+implementation|infra\s+task|infrastructure\s+task|devops\s+task)\s*\]/i.test(t)) return true;
+  // Colon prefix: "Technical Task: ", "Dev Task: "
+  if (/^(technical\s+task|tech\s+task|developer\s+task|dev\s+task|backend\s+task|engineering\s+task|eng\s+task|implementation\s+task)\s*:/i.test(t)) return true;
   return false;
 }
 
@@ -944,7 +889,7 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
   const send=(event,data)=>{try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){}};
   const log=(msg,level='info')=>send('log',{msg,level,ts:Date.now()});
   const phase=(idx,state,sub)=>send('phase',{idx,state,sub});
-  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},15000);
+  const hb=setInterval(()=>{try{res.write(': heartbeat\n\n');}catch(e){}},5000);
   try {
     log(`╔═══ TEST PLAN GENERATION STARTED ═══`);
     log(`Project: ${projectName} · Epics: ${epics.join(', ')}`);
@@ -984,7 +929,16 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       log(`✓ Epic loaded: ${epicsMeta[epicsMeta.length-1].meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);
     }    phase(1,'done',`${epics.length} epics fetched`);phase(2,'active','');
     const slbe={};let totalStories=0;
-    for(const em of epicsMeta){const jql=`parent in (${em.id}) AND issuetype = Story`;log(`JQL: "${jql}"`);const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const issues=sr.issues||[];slbe[em.id]=issues;log(`✓ ${issues.length} stories for ${em.id}`,'ok');issues.forEach(s=>log(`    • ${s.key} — ${s.fields&&s.fields.summary}`));totalStories+=issues.length;}
+    for(const em of epicsMeta){const jql=`parent in (${em.id}) AND issuetype = Story`;log(`JQL: "${jql}"`);const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const rawIssues=sr.issues||[];
+        const skippedDev=rawIssues.filter(s=>isDevStory(s.fields&&s.fields.summary));
+        const issues=rawIssues.filter(s=>!isDevStory(s.fields&&s.fields.summary));
+        slbe[em.id]=issues;
+        // Store skipped stories for test plan "Notes" section
+        if(!slbe.__skipped) slbe.__skipped={};
+        if(skippedDev.length) slbe.__skipped[em.id]=skippedDev.map(s=>({key:s.key,summary:s.fields&&s.fields.summary}));
+        log(`✓ ${issues.length} stories for ${em.id}`+(skippedDev.length?` (${skippedDev.length} technical task stories skipped: ${skippedDev.map(s=>s.key).join(', ')})`:''),'ok');
+        issues.forEach(s=>log(`    • ${s.key} — ${s.fields&&s.fields.summary}`));
+        if(skippedDev.length) skippedDev.forEach(s=>log(`    ⊘ ${s.key} — ${s.fields&&s.fields.summary} [SKIPPED: Technical Task]`,'warn'));totalStories+=issues.length;}
     phase(2,'done',`${totalStories} stories found`);if(totalStories===0)log(`⚠ No stories found. Check JQL permissions.`,'warn');
     phase(3,'active',`0 of ${totalStories}`);const allEpics=[];let done=0;
     for(const em of epicsMeta){const list=slbe[em.id];const details=list.length>0?await fetchStoriesParallel(client,list,log):[];allEpics.push({id:em.id,meta:em.meta,stories:details});done+=list.length;phase(3,'active',`${done} of ${totalStories}`);}
@@ -1012,7 +966,8 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     await recordStatEvent(req.user.email,'testPlans');
     log(`✓ Plan saved to database`,'ok');phase(4,'done','saved to database');
     phase(5,'active','synthesizing');phase(5,'done','complete');log(`╚═══ GENERATION COMPLETE ═══`,'ok');
-    send('complete',{planId,summary,stats:{epics:summary.totals.epics,stories:summary.totals.stories,scenarios:summary.totals.stories*4,ac:summary.totals.acceptanceCriteria}});
+    const skippedDevList = Object.values(slbe.__skipped||{}).flat();
+    send('complete',{planId,summary,skippedDevStories:skippedDevList,stats:{epics:summary.totals.epics,stories:summary.totals.stories,scenarios:summary.totals.stories*4,ac:summary.totals.acceptanceCriteria}});
   } catch(err) {
     console.error('[generate] FAILED:',err);
     try{log(`╚═══ FAILED: ${err.message} ═══`,'err');send('error',{error:err.message||'Unknown error'});}catch(e){}
@@ -1063,7 +1018,7 @@ function buildStorySummary(stories) {
       `## Story ${i+1}: ${s.id} — ${s.title}`,
       ``,
       `### Description`,
-      s.desc || '(no description)',
+      (s.desc || '(no description)').slice(0, 800),
       ``,
       `### Requirements (${reqs.length})`,
       reqText
@@ -1265,7 +1220,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const send  = (event,data) => { try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){} };
   const log   = (msg,level='info') => send('log',{msg,level,ts:Date.now()});
   const phase = (idx,state,sub)   => send('phase',{idx,state,sub});
-  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },15000);
+  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },5000);
 
   // ─── PHASES ────────────────────────────────────────────────────────────────
   // 0: Authenticate   1: Fetch Epics   2: Find Stories
@@ -1308,9 +1263,11 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     for(const em of epicsMeta){
       const jql=`parent in (${em.id}) AND issuetype = Story ORDER BY created ASC`;
       const sr=await client.withRetry(`stories(${em.id})`,()=>client.searchByJql(jql,['summary','status'],100),CONFIG.mcp.maxRetries,log);
-      storyListByEpic[em.id] = sr.issues||[];
-      totalStories += storyListByEpic[em.id].length;
-      log(`✓ ${em.id}: ${storyListByEpic[em.id].length} stories`,'ok');
+      const rawIssues2=sr.issues||[];
+      const skippedDev2=rawIssues2.filter(s=>isDevStory(s.fields&&s.fields.summary));
+      storyListByEpic[em.id]=rawIssues2.filter(s=>!isDevStory(s.fields&&s.fields.summary));
+      totalStories+=storyListByEpic[em.id].length;
+      log(`✓ ${em.id}: ${storyListByEpic[em.id].length} stories`+(skippedDev2.length?` (${skippedDev2.length} technical tasks skipped: ${skippedDev2.map(s=>s.key).join(', ')})`:''),'ok');
     }
     if(totalStories===0){ log(`⚠ No stories found — check epic IDs and Jira permissions`,'warn'); }
     phase(2,'done',`${totalStories} stories found`);
@@ -1353,7 +1310,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
-    const BATCH_SIZE = 3; // stories per Claude call
+    const BATCH_SIZE = 2;
 
     if(!ANTHROPIC_KEY){
       log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
@@ -1397,7 +1354,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
               headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
               body: JSON.stringify({
                 model:      'claude-sonnet-4-6',
-                max_tokens: 8000,
+                max_tokens: 16000,
                 system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
                 messages:   [{role:'user', content: prompt}]
               })
