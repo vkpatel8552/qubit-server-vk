@@ -523,6 +523,58 @@ function adfToPlainText(adf) {
 
 // Extract ALL meaningful content from a story description as requirement lines.
 // NO heading filtering — every bullet, table row, and meaningful sentence is a requirement.
+function extractAcceptanceCriteria(descText) {
+  if (!descText) return [];
+  const results = [];
+  const seen = new Set();
+
+  function addLine(line) {
+    line = line.trim();
+    // Remove ADF artifacts and leading markers
+    line = line.replace(/^[•\-\*]\s*/, '').replace(/^\d+[\.\)]\s*/, '').trim();
+    if (line.length < 8) return;          // too short to be meaningful
+    if (seen.has(line.toLowerCase())) return; // deduplicate
+    // Skip pure section headings (short lines without verbs or details)
+    if (line.length < 20 && !/\b(is|are|should|must|will|can|do|does|has|have|when|if|then|not|no|all|any|the)\b/i.test(line)) return;
+    seen.add(line.toLowerCase());
+    results.push(line);
+  }
+
+  const lines = descText.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // Bullet point or numbered item
+    const bulletMatch = trimmed.match(/^[•\-\*]\s*(.{8,})/) || trimmed.match(/^\d+[\.\)]\s*(.{8,})/);
+    if (bulletMatch) {
+      addLine(bulletMatch[1]);
+      continue;
+    }
+
+    // Table row (pipe-separated) — each cell is a requirement
+    if (trimmed.includes(' | ')) {
+      const cells = trimmed.split(' | ').map(c => c.trim()).filter(c => c.length > 8);
+      // Skip pure header rows (all short words or "---")
+      if (cells.some(c => c.includes(' ') && !c.startsWith('-'))) {
+        cells.forEach(cell => addLine(cell));
+      }
+      continue;
+    }
+
+    // Paragraph sentence (skip short headings, keep meaningful sentences)
+    if (trimmed.length > 30 && !trimmed.startsWith('#') && !trimmed.startsWith('---')) {
+      // Split long paragraphs into sentences
+      const sentences = trimmed.split(/(?<=[.!?])\s+/);
+      for (const sentence of sentences) {
+        if (sentence.length > 20) addLine(sentence);
+      }
+    }
+  }
+
+  return results.slice(0, 40); // max 40 requirements per story
+}
+
 
 function extractAcceptanceCriteria(descText) {
   if (!descText) return [];
@@ -996,7 +1048,7 @@ function buildStorySummary(stories) {
       `## Story ${i+1}: ${s.id} — ${s.title}`,
       ``,
       `### Description`,
-      (s.desc || '(no description)').slice(0, 800),
+      s.desc || '(no description)',
       ``,
       `### Requirements (${reqs.length})`,
       reqText
@@ -1198,7 +1250,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const send  = (event,data) => { try{res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);}catch(e){} };
   const log   = (msg,level='info') => send('log',{msg,level,ts:Date.now()});
   const phase = (idx,state,sub)   => send('phase',{idx,state,sub});
-  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },5000);
+  const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },15000);
 
   // ─── PHASES ────────────────────────────────────────────────────────────────
   // 0: Authenticate   1: Fetch Epics   2: Find Stories
@@ -1279,182 +1331,155 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     }
     phase(4,'done',`Confluence: ${Object.keys(confluenceByEpic).length} of ${epicsMeta.length} found`);
 
-    // ─── Phase 5: Generate test cases via Claude AI ───────────────────────────
-    // Stories are processed in batches of 3 to keep each prompt manageable.
-    // This avoids token truncation which was causing JSON parse failures.
-    phase(5,'active','Calling Claude AI...');
-    log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
+    // ─── Phase 5: Generate test cases via Claude AI (parallel workers) ─────────
+    // Each story runs as its own Claude call. All fire simultaneously (up to WORKER_CONCURRENCY).
+    // 14 stories × 25s sequential = 350s → ~30s parallel. No more timeouts.
+    phase(5,'active','Calling Claude AI (parallel)...');
+    log(`╔═══ AI TEST CASE GENERATION — PARALLEL ═══`,'ok');
     const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     const generatedCases = [];
-    const BATCH_SIZE = 2; // 2 stories per call
+    const WORKER_CONCURRENCY = 5; // max simultaneous Anthropic API calls
 
     if(!ANTHROPIC_KEY){
-      log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
-      log(`  Add it: Render → service → Environment → ANTHROPIC_API_KEY = sk-ant-...`,'warn');
+      log(`✗ ANTHROPIC_API_KEY not set — add it in Render → Environment`,'err');
     } else {
-      let caseNum = 1;
 
+      // Build flat job list across all epics
+      const jobs = [];
       for(const epic of allEpics){
-        const allStories = epic.stories||[];
-        if(!allStories.length){ log(`  Skipping ${epic.id} — no stories`,'warn'); continue; }
+        const stories = epic.stories||[];
+        if(!stories.length) continue;
+        const confData = confluenceByEpic[epic.id]||null;
+        log(`  Epic: ${epic.title||epic.id} — ${stories.length} stories queued`,'ok');
+        stories.forEach((story,si) => {
+          jobs.push({epic, story, si,
+            confContent: si===0&&confData ? confData.content : null,
+            confTitle:   si===0&&confData ? confData.title   : null
+          });
+        });
+      }
+      log(`  ${jobs.length} total stories — ${WORKER_CONCURRENCY} parallel workers`,'ok');
+      send('progress',{pct:57, msg:`Launching ${jobs.length} parallel AI workers...`});
 
-        log(`  Epic: ${epic.title||epic.id} — ${allStories.length} stories, processing in batches of ${BATCH_SIZE}`,'ok');
+      // Per-story worker: builds prompt → calls Claude → parses JSON
+      const processStory = async (job, idx) => {
+        const {epic, story, confContent, confTitle} = job;
+        const label = `${story.id} (${idx+1}/${jobs.length})`;
+        log(`  → Worker ${idx+1}: ${story.id}`,'info');
 
-        const confData    = confluenceByEpic[epic.id] || null;
-        const confContent = confData ? confData.content : null;
-        const confTitle   = confData ? confData.title   : null;
+        const prompt = buildServerTCPrompt(
+          epic.title||epic.id, epic.id,
+          [story], confContent, confTitle
+        );
 
-        // Split stories into batches
-        const batches = [];
-        for(let i=0; i<allStories.length; i+=BATCH_SIZE){
-          batches.push(allStories.slice(i, i+BATCH_SIZE));
-        }
-
-        for(let bi=0; bi<batches.length; bi++){
-          const batchStories = batches[bi];
-          const batchIds = batchStories.map(s=>s.id).join(', ');
-          log(`  Batch ${bi+1}/${batches.length}: ${batchIds}`,'info');
-
-          const prompt = buildServerTCPrompt(
-            epic.title||epic.id,
-            epic.id,
-            batchStories,
-            bi===0 ? confContent : null,  // only include Confluence in first batch
-            bi===0 ? confTitle   : null
-          );
-          log(`  Prompt: ${prompt.length} chars | ${batchStories.length} stories`,'info');
-
-          try {
-            // AbortController timeout — Render kills connections after 30s by default.
-            // Claude Sonnet can take 60-90s for large outputs. Use node-fetch timeout.
-            const fetchCtrl = new AbortController();
-            const fetchTimeout = setTimeout(() => fetchCtrl.abort(), 120000); // 120s
-            let aiResp;
-            try {
-              aiResp = await fetch('https://api.anthropic.com/v1/messages', {
-                method:'POST',
-                signal: fetchCtrl.signal,
-                headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
-                body: JSON.stringify({
-                  model:      'claude-sonnet-4-6',
-                  max_tokens: 16000,
-                  system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
-                  messages:   [{role:'user', content: prompt}]
-                })
-              });
-            } finally {
-              clearTimeout(fetchTimeout);
-            }
-
-            const aiData = await aiResp.json();
-            if(!aiResp.ok) throw new Error(`Anthropic API ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
-
-            const rawText = (aiData.content?.[0]?.text || '').trim();
-            log(`  Response: ${rawText.length} chars | tokens: ${aiData.usage?.input_tokens||'?'} in / ${aiData.usage?.output_tokens||'?'} out`,'ok');
-
-            // Robust JSON extraction — handles any whitespace or trailing text
-            let cleanRaw = rawText.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
-            const jsonStart = cleanRaw.indexOf('[');
-            const jsonEnd   = cleanRaw.lastIndexOf(']');
-            if(jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart){
-              throw new Error(`No JSON array found. Preview: ${rawText.slice(0,200)}`);
-            }
-            let jsonStr = cleanRaw.slice(jsonStart, jsonEnd+1);
-            // Attempt parse; if truncated, try to repair by closing open objects
-            let cases;
-            try {
-              cases = JSON.parse(jsonStr);
-            } catch(parseErr) {
-              // Response was truncated — try to recover partial cases
-              log(`  ⚠ JSON parse failed (likely truncation), attempting recovery...`,'warn');
-              // Find last complete object by splitting on },{ pattern
-              const lastComplete = jsonStr.lastIndexOf('},');
-              if(lastComplete > jsonStart) {
-                try { cases = JSON.parse(jsonStr.slice(0, lastComplete+1) + ']'); }
-                catch(e){ cases = []; }
-              } else { cases = []; }
-            }
-
-            if(!Array.isArray(cases) || !cases.length){
-              throw new Error(`Empty or invalid array. Raw: ${rawText.slice(0,200)}`);
-            }
-
-            cases.forEach(tc => {
-              generatedCases.push({
-                caseId:        `${prefix}-${String(caseNum++).padStart(3,'0')}`,
-                title:         (tc.title||`Validate ${epic.title||epic.id}`).trim(),
-                category:      tc.category || 'Positive Flows',
-                preconditions: (tc.preconditions||'').replace(/\n+/g,' ').trim(),
-                credentials:   tc.credentials || 'Account Manager',
-                stories:       tc.storyIds || batchStories.map(s=>s.id),
-                acRefs:        tc.acRefs || [],
-                steps:         (tc.steps||[]).map((s,si) => ({
-                  stepNum:        si+1,
-                  action:         (s.action||'').trim(),
-                  expectedResult: (s.expectedResult||s.expected||'').trim()
-                }))
-              });
-            });
-            log(`  ✓ Batch ${bi+1}: ${cases.length} test case(s)`,'ok');
-
-          } catch(aiErr) {
-            const isAbort = aiErr.name === 'AbortError';
-            log(`  ✗ Batch ${bi+1} failed: ${isAbort?'timeout (120s exceeded)':aiErr.message}`,'err');
-            // Retry once on network/timeout errors
-            if(isAbort || aiErr.message.includes('network') || aiErr.message.includes('socket')) {
-              log(`  ↻ Retrying batch ${bi+1}...`,'warn');
-              await new Promise(r=>setTimeout(r,3000)); // wait 3s before retry
-              try {
-                const retryCtrl = new AbortController();
-                const retryTimeout = setTimeout(()=>retryCtrl.abort(), 120000);
-                let retryResp;
-                try {
-                  retryResp = await fetch('https://api.anthropic.com/v1/messages', {
-                    method:'POST', signal: retryCtrl.signal,
-                    headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
-                    body: JSON.stringify({model:'claude-sonnet-4-6', max_tokens:16000,
-                      system:'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
-                      messages:[{role:'user', content: prompt}]})
-                  });
-                } finally { clearTimeout(retryTimeout); }
-                const retryData = await retryResp.json();
-                const retryRaw = (retryData.content?.[0]?.text||'').trim()
-                  .replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
-                const rStart = retryRaw.indexOf('['), rEnd = retryRaw.lastIndexOf(']');
-                if(rStart!==-1 && rEnd>rStart) {
-                  const retryCases = JSON.parse(retryRaw.slice(rStart, rEnd+1));
-                  if(Array.isArray(retryCases) && retryCases.length) {
-                    retryCases.forEach(tc => generatedCases.push({
-                      caseId:`${prefix}-${String(++caseNum-1).padStart(3,'0')}`,
-                      title:(tc.title||'Validate '+epic.title).trim(),
-                      category:tc.category||'Positive Flows',
-                      preconditions:(tc.preconditions||'').replace(/[\n\r]+/g,' ').trim(),
-                      credentials:tc.credentials||'Account Manager',
-                      stories:tc.storyIds||batchStories.map(s=>s.id),
-                      acRefs:tc.acRefs||[],
-                      steps:(tc.steps||[]).map((s,si)=>({stepNum:si+1,action:(s.action||'').trim(),expectedResult:(s.expectedResult||s.expected||'').trim()}))
-                    }));
-                    log(`  ✓ Retry succeeded: ${retryCases.length} case(s)`,'ok');
-                  }
-                }
-              } catch(retryErr) {
-                log(`  ✗ Retry also failed: ${retryErr.message}`,'err');
-              }
-            }
+        const ctrl = new AbortController();
+        const tout = setTimeout(()=>ctrl.abort(), 90000);
+        try {
+          const resp = await fetch('https://api.anthropic.com/v1/messages', {
+            method:'POST', signal:ctrl.signal,
+            headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
+            body: JSON.stringify({
+              model:'claude-sonnet-4-6', max_tokens:8192,
+              system:'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ]. Generate maximum 5 test cases. Be concise.',
+              messages:[{role:'user',content:prompt}]
+            })
+          });
+          clearTimeout(tout);
+          const data = await resp.json();
+          if(!resp.ok) throw new Error(`API ${resp.status}: ${data.error?.message||JSON.stringify(data.error)}`);
+          const raw = (data.content?.[0]?.text||'').trim();
+          log(`  ✓ ${label}: ${raw.length} chars | ${data.usage?.input_tokens||'?'}in/${data.usage?.output_tokens||'?'}out`,'ok');
+          let clean = raw.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+          const j0=clean.indexOf('['), j1=clean.lastIndexOf(']');
+          if(j0===-1||j1<j0) throw new Error(`No JSON. Preview: ${raw.slice(0,150)}`);
+          let cases;
+          try { cases=JSON.parse(clean.slice(j0,j1+1)); }
+          catch(e){
+            const lc=clean.slice(j0,j1+1).lastIndexOf('},');
+            cases = lc>0 ? JSON.parse(clean.slice(j0,j0+lc+1)+']') : [];
           }
-        } // end batch loop
-      } // end epic loop
+          return {story, cases: Array.isArray(cases)?cases:[], error:null};
+        } catch(err) {
+          clearTimeout(tout);
+          log(`  ✗ ${label}: ${err.name==='AbortError'?'timeout 90s':err.message}`,'err');
+          return {story, cases:[], error:err.message};
+        }
+      };
+
+      // Concurrency pool: keep WORKER_CONCURRENCY calls active at all times
+      const results = new Array(jobs.length);
+      let nextJob=0, completed=0;
+      const pool = [];
+      const kickNext = () => {
+        while(pool.length < WORKER_CONCURRENCY && nextJob < jobs.length){
+          const idx = nextJob++;
+          const p = processStory(jobs[idx], idx).then(r => {
+            results[idx]=r;
+            pool.splice(pool.indexOf(p),1);
+            completed++;
+            const pct=Math.round(57+(completed/jobs.length)*38);
+            const soFar=results.filter(r=>r&&r.cases.length).reduce((n,r)=>n+r.cases.length,0);
+            send('progress',{pct, msg:`${completed}/${jobs.length} done — ${soFar} TCs`});
+            kickNext();
+          });
+          pool.push(p);
+        }
+      };
+      kickNext();
+      while(pool.length>0) await Promise.race(pool);
+
+      // Collect results in original story order
+      let caseNum=1;
+      results.forEach(r=>{
+        if(!r||!r.cases.length) return;
+        r.cases.forEach(tc=>{
+          generatedCases.push({
+            caseId:`${prefix}-${String(caseNum++).padStart(3,'0')}`,
+            title:(tc.title||`Validate ${r.story.title||r.story.id}`).trim(),
+            category:tc.category||'Positive Flows',
+            preconditions:(tc.preconditions||'').replace(/[\n\r]+/g,' ').trim(),
+            credentials:tc.credentials||'Account Manager',
+            stories:tc.storyIds||[r.story.id],
+            acRefs:tc.acRefs||[],
+            steps:(tc.steps||[]).map((s,si)=>({stepNum:si+1,action:(s.action||'').trim(),expectedResult:(s.expectedResult||s.expected||'').trim()}))
+          });
+        });
+      });
+      log(`  ${results.filter(r=>r&&!r.error).length}/${jobs.length} workers succeeded`,'ok');
     }
 
-    phase(5,'done',`${generatedCases.length} test cases generated`);
-    log(`╚═══ COMPLETE: ${generatedCases.length} test cases ═══`,'ok');
+    // Merge TCs with same credentials + category + combined ≤18 steps + 2+ shared title words
+    const merged=[], used=new Set();
+    for(let i=0;i<generatedCases.length;i++){
+      if(used.has(i)) continue;
+      const tc={...generatedCases[i],steps:[...generatedCases[i].steps]};
+      for(let j=i+1;j<generatedCases.length;j++){
+        if(used.has(j)) continue;
+        const o=generatedCases[j];
+        if(tc.credentials!==o.credentials||tc.category!==o.category) continue;
+        if(tc.steps.length+o.steps.length>18) continue;
+        const wA=new Set(tc.title.toLowerCase().split(/\W+/).filter(w=>w.length>4));
+        if(o.title.toLowerCase().split(/\W+/).filter(w=>w.length>4&&wA.has(w)).length<2) continue;
+        tc.steps=[...tc.steps,...o.steps].slice(0,18);
+        tc.stories=[...new Set([...tc.stories,...o.stories])];
+        if(o.title.length>tc.title.length) tc.title=o.title;
+        used.add(j);
+      }
+      merged.push(tc); used.add(i);
+    }
+    merged.forEach((tc,i)=>{tc.caseId=`${prefix}-${String(i+1).padStart(3,'0')}`;});
+    if(merged.length<generatedCases.length) log(`  Merged ${generatedCases.length}→${merged.length} test cases`,'ok');
+    const finalCases=merged.length?merged:generatedCases;
+
+    phase(5,'done',`${finalCases.length} test cases generated`);
+    log(`╚═══ COMPLETE: ${finalCases.length} test cases ═══`,'ok');
     send('complete',{
       projectName, release, epics, prefix,
       allEpics,
       totalStories,
       generatedBy:    req.user.fullName,
       site:           jira.siteUrl,
-      generatedCases
+      generatedCases: finalCases
     });
 
   } catch(err) {
