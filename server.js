@@ -2,15 +2,15 @@
  * qubit-server v1.5.0
  * PostgreSQL-backed: users, sessions, connectors, test plans, stats
  * Email: Mailgun SMTP via nodemailer
- * v1.5: Full TP epic cache (skip Phase 2 JQL + Phase 3 story fetch), archive v3 reset,
- *       epic-cache dir wipe on migration, token stats always shown
+ * v1.4: Logic-based TC generation, epic summary caching (./epic-cache/)
+ * v1.5: TP epic cache (skip Phase 2 JQL + Phase 3 story fetch for cached epics),
+ *       SCHEMA_VERSION 3 archive reset, token stats in completion event
  */
 'use strict';
 
 const express    = require('express');
 const cors       = require('cors');
 const crypto     = require('crypto');
-const fs         = require('fs');
 
 // ─── Token Encryption (AES-256-GCM) ──────────────────────────────────────────
 // Key is derived from an env secret + a per-installation salt.
@@ -51,33 +51,8 @@ function decryptToken(stored) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 const path       = require('path');
+const fs         = require('fs');
 const https      = require('https');
-
-// ─── Epic Summary Cache ───────────────────────────────────────────────────────
-// Saves fetched Jira epic data to ./epic-cache/<epicId>.json (not publicly served).
-// Checked before each Jira fetch; if fresh (<24h) the cache is used instead.
-const EPIC_CACHE_DIR = path.join(__dirname, 'epic-cache');
-const EPIC_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-try { if (!fs.existsSync(EPIC_CACHE_DIR)) fs.mkdirSync(EPIC_CACHE_DIR, { recursive: true }); } catch(e) {}
-
-function getEpicCache(epicId) {
-  try {
-    const file = path.join(EPIC_CACHE_DIR, `${epicId.replace(/[^A-Za-z0-9_-]/g,'_')}.json`);
-    if (!fs.existsSync(file)) return null;
-    const stat = fs.statSync(file);
-    if (Date.now() - stat.mtimeMs > EPIC_CACHE_TTL_MS) return null; // stale
-    const raw = fs.readFileSync(file, 'utf8');
-    return JSON.parse(raw);
-  } catch(e) { return null; }
-}
-
-function setEpicCache(epicId, data) {
-  try {
-    const file = path.join(EPIC_CACHE_DIR, `${epicId.replace(/[^A-Za-z0-9_-]/g,'_')}.json`);
-    fs.writeFileSync(file, JSON.stringify({ epicId, cachedAt: new Date().toISOString(), data }), 'utf8');
-  } catch(e) { console.warn('[epic-cache] write failed:', e.message); }
-}
-// ─────────────────────────────────────────────────────────────────────────────
 const nodemailer = require('nodemailer');
 const { Pool }   = require('pg');
 
@@ -123,8 +98,30 @@ async function db(sql, params = []) {
   finally { client.release(); }
 }
 
-// Current schema version — bump to trigger a one-time archive purge on next deploy.
+// ─── Schema version — bump to wipe archive data on next boot ─────────────────
 const SCHEMA_VERSION = 3;
+
+// ─── Epic summary cache (24h TTL, stored in ./epic-cache/) ───────────────────
+const EPIC_CACHE_DIR = path.join(__dirname, 'epic-cache');
+const EPIC_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+try { if (!fs.existsSync(EPIC_CACHE_DIR)) fs.mkdirSync(EPIC_CACHE_DIR, { recursive: true }); } catch(e) {}
+
+function getEpicCache(epicId) {
+  try {
+    const f = path.join(EPIC_CACHE_DIR, `${epicId}.json`);
+    if (!fs.existsSync(f)) return null;
+    const entry = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (Date.now() - new Date(entry.cachedAt).getTime() > EPIC_CACHE_TTL) { fs.unlinkSync(f); return null; }
+    return entry;
+  } catch(e) { return null; }
+}
+
+function setEpicCache(epicId, data) {
+  try {
+    const entry = { cachedAt: new Date().toISOString(), data };
+    fs.writeFileSync(path.join(EPIC_CACHE_DIR, `${epicId}.json`), JSON.stringify(entry), 'utf8');
+  } catch(e) { console.warn('[cache] Could not write epic cache:', e.message); }
+}
 
 async function initDB() {
   await db(`CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, data JSONB NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())`);
@@ -150,28 +147,22 @@ async function initDB() {
     generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await db(`CREATE INDEX IF NOT EXISTS idx_test_cases_email ON test_cases(email)`);
-
-  // ── Schema version tracking & one-time archive reset ─────────────────────
-  await db(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT)`);
+  // Schema version tracking — triggers archive wipe on version bump
+  await db(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
   const vRow = await db(`SELECT value FROM schema_meta WHERE key='version'`);
   const currentVer = vRow.rows[0] ? parseInt(vRow.rows[0].value, 10) : 0;
   if (currentVer < SCHEMA_VERSION) {
-    console.log(`[db] Schema migration ${currentVer} → ${SCHEMA_VERSION}: purging archive data…`);
-    await db(`TRUNCATE TABLE test_plans RESTART IDENTITY CASCADE`).catch(e => db(`DELETE FROM test_plans`));
-    await db(`TRUNCATE TABLE test_cases RESTART IDENTITY CASCADE`).catch(e => db(`DELETE FROM test_cases`));
-    await db(`TRUNCATE TABLE stat_events RESTART IDENTITY CASCADE`).catch(e => db(`DELETE FROM stat_events`));
-    await db(`INSERT INTO schema_meta(key,value) VALUES('version','${SCHEMA_VERSION}') ON CONFLICT(key) DO UPDATE SET value='${SCHEMA_VERSION}'`);
-    // Also clear the epic-cache directory so stale Jira data is not served
+    await db(`TRUNCATE TABLE test_plans, test_cases, stat_events`);
+    await db(`INSERT INTO schema_meta(key,value) VALUES('version','${SCHEMA_VERSION}') ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`);
     try {
       if (fs.existsSync(EPIC_CACHE_DIR)) {
-        const cacheFiles = fs.readdirSync(EPIC_CACHE_DIR);
-        cacheFiles.forEach(f => { try { fs.unlinkSync(path.join(EPIC_CACHE_DIR, f)); } catch(e){} });
-        console.log(`[db] Cleared ${cacheFiles.length} epic-cache file(s)`);
+        const files = fs.readdirSync(EPIC_CACHE_DIR);
+        files.forEach(f => { try { fs.unlinkSync(path.join(EPIC_CACHE_DIR, f)); } catch(e) {} });
+        console.log(`[db] Cleared ${files.length} epic-cache file(s)`);
       }
     } catch(e) { console.warn('[db] Could not clear epic-cache:', e.message); }
-    console.log('[db] Archive purged — starting fresh');
+    console.log(`[db] Archive purged (schema v${currentVer} → v${SCHEMA_VERSION})`);
   }
-
   console.log('[db] Tables ready');
 }
 
@@ -957,24 +948,22 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
 
     phase(1,'active',`0 of ${epics.length}`);const epicsMeta=[];
     let totalCharsProcessed = 0;
-    const tpFullyCachedEpics = {}; // epicId → cached data (epic + stories) — skip Phases 2 & 3
+    const tpFullyCachedEpics = {}; // epicId → cached data — skip Phases 2 & 3
     let tpCacheHitCount = 0;
     for(let i=0;i<epics.length;i++){
       const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);
-
-      // ── Check epic cache first (require stories — partial cache miss goes to Jira) ──
+      // ── Check epic cache first ──────────────────────────────────────────────
       const cached = getEpicCache(id);
       if (cached && cached.data && cached.data.stories && cached.data.stories.length >= 0) {
         const cd = cached.data;
         epicsMeta.push(cd.epicMeta);
         tpFullyCachedEpics[id] = cd;
         tpCacheHitCount++;
-        log(`✓ [FULL CACHE HIT] ${id} — epic + ${cd.stories.length} stories from cache (${cached.cachedAt}) — Jira fetch skipped`,'ok');
         totalCharsProcessed += cd.charsProcessed || 0;
+        log(`✓ [CACHE HIT] ${id} — epic + ${cd.stories.length} stories from cache (${cached.cachedAt}) — Jira skipped`,'ok');
         phase(1,'active',`${i+1} of ${epics.length}`);
         continue;
       }
-
       const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','assignee','reporter','duedate','priority','issuetype']),CONFIG.mcp.maxRetries,log);
       const epicType = epic.fields.issuetype?.name || '';
       if (!['Epic','epic'].includes(epicType) && epicType !== '') {
@@ -984,7 +973,6 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       }
       const dt=adfToPlainText(epic.fields.description);
       totalCharsProcessed += (dt||'').length;
-      // Enrich roles from Jira fields + changelog
       const roles = await extractEpicRoles(client, id, epic.fields, fieldMap);
       log(`✓ Roles — EM: ${roles.engineeringManager} | QA: ${roles.qaValidator||'—'} | Stakeholders: ${roles.stakeholders.length}`,'ok');
       const epicMeta = {id,meta:{
@@ -999,14 +987,13 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
         stakeholders:roles.stakeholders
       }};
       epicsMeta.push(epicMeta);
-      // Save basic epic metadata to cache (stories added after Phase 3)
       setEpicCache(id, { epicMeta, charsProcessed: (dt||'').length });
       log(`✓ Epic loaded: ${epicMeta.meta.title}`,'ok');phase(1,'active',`${i+1} of ${epics.length}`);
     }
     phase(1,'done',`${epics.length} epics fetched`);phase(2,'active','');
     const slbe={};let totalStories=0;
     for(const em of epicsMeta){
-      // ── Fully cached epic: skip JQL, use stored story list ──────────────────
+      // ── Cached epic: skip JQL, use stored story list ────────────────────────
       if (tpFullyCachedEpics[em.id]) {
         const cachedStories = tpFullyCachedEpics[em.id].stories;
         slbe[em.id] = cachedStories.map(s=>({key:s.id,fields:{summary:s.title||''}}));
@@ -1019,18 +1006,17 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       const skippedDev=rawIssues.filter(s=>isDevStory(s.fields&&s.fields.summary));
       const issues=rawIssues.filter(s=>!isDevStory(s.fields&&s.fields.summary));
       slbe[em.id]=issues;
-      // Store skipped stories for test plan "Notes" section
       if(!slbe.__skipped) slbe.__skipped={};
       if(skippedDev.length) slbe.__skipped[em.id]=skippedDev.map(s=>({key:s.key,summary:s.fields&&s.fields.summary}));
-      log(`✓ ${issues.length} stories for ${em.id}`+(skippedDev.length?` (${skippedDev.length} technical task stories skipped: ${skippedDev.map(s=>s.key).join(', ')})`:''),'ok');
+      log(`✓ ${issues.length} stories for ${em.id}`+(skippedDev.length?` (${skippedDev.length} dev stories skipped)`:''),'ok');
       issues.forEach(s=>log(`    • ${s.key} — ${s.fields&&s.fields.summary}`));
-      if(skippedDev.length) skippedDev.forEach(s=>log(`    ⊘ ${s.key} — ${s.fields&&s.fields.summary} [SKIPPED: Technical Task]`,'warn'));
+      if(skippedDev.length) skippedDev.forEach(s=>log(`    ⊘ ${s.key} [SKIPPED: Technical Task]`,'warn'));
       totalStories+=issues.length;
     }
     phase(2,'done',`${totalStories} stories found`);if(totalStories===0)log(`⚠ No stories found. Check JQL permissions.`,'warn');
     phase(3,'active',`0 of ${totalStories}`);const allEpics=[];let done=0;
     for(const em of epicsMeta){
-      // ── Fully cached epic: skip story-detail fetch, use cached stories ──────────
+      // ── Cached epic: skip story detail fetch ────────────────────────────────
       if (tpFullyCachedEpics[em.id]) {
         const details = tpFullyCachedEpics[em.id].stories;
         allEpics.push({id:em.id,meta:em.meta,stories:details});
@@ -1043,13 +1029,9 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       const details=list.length>0?await fetchStoriesParallel(client,list,log):[];
       allEpics.push({id:em.id,meta:em.meta,stories:details});
       done+=list.length;
-      // Accumulate story char counts and update cache with full story data
       const storyChars = details.reduce((s,st)=>s+(st.desc||'').length,0);
       totalCharsProcessed += storyChars;
-      setEpicCache(em.id, {
-        epicMeta: em, charsProcessed: (em.meta.description||'').length + storyChars,
-        stories: details
-      });
+      setEpicCache(em.id, { epicMeta: em, charsProcessed: (em.meta.description||'').length + storyChars, stories: details });
       phase(3,'active',`${done} of ${totalStories}`);
     }
     phase(3,'done',`${totalStories} stories enriched`);phase(4,'active','saving to database');
@@ -1079,14 +1061,8 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     const skippedDevList = Object.values(slbe.__skipped||{}).flat();
     const estimatedTokens = Math.round(totalCharsProcessed / 4);
     const totalAcCount = allEpics.reduce((a,e)=>a+e.stories.reduce((b,s)=>b+(s.ac&&s.ac.length>0?s.ac.length:1),0),0);
-    const dataStats = {
-      totalCharsProcessed,
-      estimatedTokens,
-      storiesFetched: totalStories,
-      acCount: totalAcCount,
-      cacheHits: tpCacheHitCount
-    };
-    log(`✓ Data processed: ~${estimatedTokens.toLocaleString()} tokens equivalent (${totalCharsProcessed.toLocaleString()} chars, ${totalStories} stories, ${totalAcCount} ACs)`,'ok');
+    const dataStats = { totalCharsProcessed, estimatedTokens, storiesFetched: totalStories, acCount: totalAcCount, cacheHits: tpCacheHitCount };
+    log(`✓ Data processed: ~${estimatedTokens.toLocaleString()} tokens (${totalCharsProcessed.toLocaleString()} chars, ${totalStories} stories, ${totalAcCount} ACs, ${tpCacheHitCount} cache hits)`,'ok');
     send('complete',{planId,summary,skippedDevStories:skippedDevList,dataStats,stats:{epics:summary.totals.epics,stories:summary.totals.stories,scenarios:summary.totals.stories*4,ac:summary.totals.acceptanceCriteria}});
   } catch(err) {
     console.error('[generate] FAILED:',err);
@@ -1119,19 +1095,206 @@ app.get('/api/testplan/list', authMiddleware, async (req, res) => {
 });
 
 
-// TEST CASE — GENERATE (SSE: fetch Jira data + cache, client-side logic generates cases)
-// NOTE: No AI/Anthropic API call is made. The server fetches and enriches all story data,
-// then returns it to the client. The frontend buildFallbackCases() function generates the
-// test cases using rule-based logic — zero API tokens consumed.
+// TEST CASE — GENERATE (SSE: fetch Jira data, frontend generates cases)
+
+// Server-side TC prompt builder — same logic as client but runs on Render with real API key
 
 
 
 
 
 
-// buildStorySummary and buildServerTCPrompt removed in v1.4.0
-// Test case generation is now entirely client-side (buildFallbackCases in index.html)
-// Zero API tokens consumed — logic-based rule-driven generation only
+function buildStorySummary(stories) {
+  return stories.map((s, i) => {
+    const reqs = (s.ac||[]);
+    const reqText = reqs.length > 0
+      ? reqs.map((r, ri) => `  ${ri+1}. ${r}`).join('\n')
+      : '  (derive all test scenarios from the full description below)';
+    return [
+      `## Story ${i+1}: ${s.id} — ${s.title}`,
+      ``,
+      `### Description`,
+      (s.desc || '(no description)').slice(0, 800),
+      ``,
+      `### Requirements (${reqs.length})`,
+      reqText
+    ].join('\n');
+  }).join('\n\n---\n\n');
+}
+
+function buildServerTCPrompt(epicTitle, epicId, stories, confluenceContent, confluenceTitle) {
+  const storySummary = buildStorySummary(stories);
+  const confSection  = confluenceContent
+    ? `\n\n---\n\n## Confluence Test Plan: "${confluenceTitle}"\n\n${confluenceContent.slice(0, 2000)}`
+    : '\n\n---\n\n## Confluence Test Plan: Not found — use Jira data only';
+
+  return `You are a Senior QA Architect at ClearlyRated with 20+ years of experience.
+Generate test cases for: ${epicTitle} (${epicId})
+
+Read every word of every story description. Your test cases must be as specific and detailed as the examples below.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1: REFERENCE EXAMPLES — MATCH THIS QUALITY EXACTLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These are real test cases from this codebase. Study the title format, step writing style, and expected result format.
+
+EXAMPLE 1:
+Title: "Validate Feature Flag activation, auto-enrollment of accounts and recipients, and NEW badge lifecycle"
+Preconditions: "Firm A with flag OFF; Firm B with flag ON; Account B1 (Firm B) has 2 key contacts; no digest sent yet; User C (Firm B) has never opened Settings drawer"
+Credentials: "CR Employee, Firm B"
+Steps:
+  1. Action: "Navigate to Insights > Overview page for Account B1 (Firm B, flag ON)"
+     Expected: "Performance Digest card appears below NPS Score card"
+  2. Action: "Verify card displays State A: NEW badge, title, sub-text, Subscribe button"
+     Expected: "All elements render correctly; card is NOT in Reporting Center"
+  3. Action: "Verify key contact auto-population: open Settings drawer via Subscribe button"
+     Expected: "Settings drawer opens; both key contacts pre-populated with 'Key Contact' labels and project access summary"
+  4. Action: "Close drawer without saving and reopen from card"
+     Expected: "Drawer reopens; both key contacts still present; no changes lost"
+  5. Action: "Sign out and sign back in as different user (User D, Firm B) who has never opened drawer"
+     Expected: "NEW badge visible for User D (tracked per user, not per firm)"
+  6. Action: "User D opens Settings drawer for the first time"
+     Expected: "Drawer opens; NEW badge disappears immediately on card"
+  7. Action: "Return to User C; verify NEW badge still visible (independent state per user)"
+     Expected: "User C badge unaffected by User D's action"
+  8. Action: "Turn flag OFF for Firm B and verify card disappears"
+     Expected: "Card completely hidden for all Firm B users; no UI element present"
+  9. Action: "Turn flag back ON and verify settings are restored from before"
+     Expected: "Card reappears; frequency, recipients, and configuration preserved"
+
+EXAMPLE 2:
+Title: "Validate Settings Drawer frequency configuration, per-audience status summary, and save/error/unsaved-changes behavior"
+Preconditions: "Drawer open; Account with Client (active), Talent (suppressed - <5 responses), Employee (no projects); Monthly frequency set"
+Credentials: "Account Manager"
+Steps:
+  1. Action: "Open Settings drawer and locate frequency selector"
+     Expected: "Selector shows three options: Weekly, Monthly, Quarterly; Monthly currently selected"
+  2. Action: "Verify helper text below Monthly selection reads correctly"
+     Expected: "Text: 'Sends on the 3rd working day of each month at 9:30 AM PST. Covers all surveys with a start date in the prior calendar month.'"
+  3. Action: "Click on Weekly option in frequency selector"
+     Expected: "Weekly becomes selected; helper text updates immediately to Weekly text without page refresh"
+  4. Action: "Locate per-audience-type status summary at bottom of drawer"
+     Expected: "Summary shows at least three sections: Client (green dot), Talent (red dot), Employee (red dot)"
+  5. Action: "Verify Talent status: red dot with 'Not enough responses received in [period]. Not sent.'"
+     Expected: "Red dot and exact copy match; distinct from other suppression reasons"
+  6. Action: "Attempt to close drawer via X button without saving"
+     Expected: "Warning modal: 'You have unsaved changes. Save before closing?' with Save/Discard buttons"
+  7. Action: "Click Discard button in warning"
+     Expected: "Drawer closes; changes are reverted; next drawer open shows original settings"
+  8. Action: "Click Save Settings button after making a change"
+     Expected: "Loading indicator appears on button; 'Settings saved.' notification displays"
+  9. Action: "Simulate save error: verify error notification"
+     Expected: "Error notification: 'Something went wrong. Please try again.' Error persists; user can retry"
+
+EXAMPLE 3:
+Title: "Validate Suppression Engine: all five conditions, independent audience-type behavior, AI retry up to 24 hours, and cadence change handling"
+Preconditions: "Five test account scenarios, each triggering one suppression condition; flag ON; Monthly cadence for all"
+Credentials: "Backend test harness, AM role"
+Steps:
+  1. Action: "Test Condition 1 (zero surveys): Account A has no surveys with start date in current period"
+     Expected: "Digest suppressed silently; no email sent"
+  2. Action: "Verify Condition 1 drawer status: open Settings drawer, check Client status shows red dot and text 'No surveys in this period. Not sent.'"
+     Expected: "Drawer status correctly reflects suppression reason"
+  3. Action: "Test Condition 2 (<5 responses): Account B has 3 responses for surveys in current period"
+     Expected: "Digest suppressed silently"
+  4. Action: "Verify Condition 2 drawer status: red dot with text 'Not enough responses received in [period]. Not sent.'"
+     Expected: "Drawer shows correct copy; distinct from Condition 1"
+  5. Action: "Test Condition 5 (AI failure): Account E has 5+ responses but AI Insights generation fails"
+     Expected: "Initial send attempt triggers AI retry window"
+  6. Action: "Verify AI retry runs up to 24 hours from original scheduled send time"
+     Expected: "Retries continue; no send occurs until AI succeeds or window closes"
+  7. Action: "Test audience type independence: Account F has Client (5+ responses) and Talent (<5 responses)"
+     Expected: "Client digest sends; Talent digest suppressed independently"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2: STRICT TITLE RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The title MUST describe the complete test scenario in human-readable terms.
+
+✅ GOOD titles:
+- "Validate Feature Flag activation, auto-enrollment of accounts and recipients, and NEW badge lifecycle"
+- "Validate Settings Drawer frequency configuration, per-audience status summary, and save/error/unsaved-changes behavior"
+- "Validate Recipient Management: key contact auto-sync, add/validate/duplicate/no-access flows end-to-end"
+- "Validate Email Subject Line signal priority Ranks 1–5, audience type enforcement, no-negative-framing rule, and first-digest edge case"
+- "Validate Analytics Logging: email opened, CTA clicked, and feedback submitted events with correct aggregation and no client-facing exposure"
+- "Validate role-based visibility and access control for Performance Digest card and Settings Drawer"
+
+❌ BAD titles (NEVER do these):
+- "Validate Default state: OFF. Pending confirmation..." — this is raw Jira text, not a title
+- "Validate Example: Bill Kane has access to 3 Client..." — quoting examples from the description, not describing the test
+- "Validate Visible to: CR Employee..." — incomplete fragment
+- "Validate ENG-2942 requirements" — never use story IDs in titles
+- "Validate feature works correctly" — too vague
+
+Title formula: "Validate [Feature/Component]: [behavior1], [behavior2], and [behavior3]"
+OR: "Validate [complete scenario description that tells the reader exactly what is being tested]"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3: STEP WRITING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ACTIONS: Short, specific, one action each. Real UI element names and exact copy from the description.
+  ✅ "Navigate to Insights > Overview and locate Performance Digest card in left column"
+  ✅ "Click 'Subscribe' button on the Performance Digest card"
+  ✅ "Test Condition 2 (<5 responses): Account B has 3 responses for surveys in current period"
+  ✅ "Verify Talent status: red dot with 'Not enough responses received in [period]. Not sent.'"
+  ✅ "Log out and log in as Admin at Firm C; navigate to Insights > Overview"
+  ❌ "Check that the feature works" — too vague
+  ❌ "Assert the API returns 200" — technical jargon
+  ❌ "Verify via DevTools" — not UI-level
+
+EXPECTED RESULTS: Specific, observable, with exact quoted copy where available.
+  ✅ "Settings drawer opens; both key contacts pre-populated with 'Key Contact' labels and project access summary"
+  ✅ "Text: 'Sends on the 3rd working day of each month at 9:30 AM PST.'"
+  ✅ "Warning modal: 'You have unsaved changes. Save before closing?' with Save/Discard buttons"
+  ✅ "Digest suppressed silently; no email sent"
+  ❌ "It works correctly" — meaningless
+  ❌ "The element is visible" — not specific
+
+STEP COUNT: 12–18 per test case. Up to 20 for multi-condition scenarios.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4: GROUPING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Group by what the test case covers — not by story:
+- Same screen + same user + same flow = one test case
+- Different user role or different account = separate test case  
+- Multi-condition test (5 suppression states, 5 subject line ranks) = ONE test case with "Account A:", "Condition 1:", "Recipient A:" prefixes
+- Never create one test case per requirement bullet
+
+Expected: 4–10 test cases for a typical epic.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 5: EPIC DATA — read every word
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+${storySummary}
+${confSection}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT — return ONLY valid JSON array, nothing else
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[
+  {
+    "title": "Validate [complete scenario description — see good examples above]",
+    "category": "Positive Flows",
+    "preconditions": "Specific data state; account state; user state — separated by semicolons",
+    "credentials": "Exact role (Account Manager / Admin / CR Employee / Various roles / Backend test harness)",
+    "storyIds": ["${epicId}"],
+    "acRefs": [],
+    "steps": [
+      {
+        "action": "Navigate to [exact page] and [specific action].",
+        "expectedResult": "[Exact observable result with quoted copy from the description where available]"
+      }
+    ]
+  }
+]`;
+}
 
 
 
@@ -1156,9 +1319,8 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
   const hb    = setInterval(()=>{ try{res.write(': heartbeat\n\n');}catch(e){} },5000);
 
   // ─── PHASES ────────────────────────────────────────────────────────────────
-  // 0: Authenticate   1: Fetch Epics (cache-first)   2: Find Stories
-  // 3: Fetch Stories  4: Fetch Confluence             5: Prepare Data for Client
-  // 6: [Client-side] Generate Test Cases (Logic — no AI tokens)
+  // 0: Authenticate   1: Fetch Epics   2: Find Stories
+  // 3: Fetch Stories  4: Fetch Confluence  5: Generate Test Cases (AI)
 
   try {
     log(`╔═══ TEST CASE GENERATION ═══`);
@@ -1171,27 +1333,12 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     log(`✓ Authenticated as ${me.displayName}`,'ok');
     phase(0,'done',`${me.displayName}`);
 
-    // ─── Phase 1: Fetch epic metadata (cache-first) ──────────────────────────
+    // ─── Phase 1: Fetch epic metadata ────────────────────────────────────────
     phase(1,'active',`0 of ${epics.length}`);
     const epicsMeta = [];
-    let tcTotalChars = 0;
-    const fullCacheHits = [];
     for(let i=0;i<epics.length;i++){
       const id=epics[i];
       log(`Fetching epic ${i+1}/${epics.length}: ${id}`);
-
-      // Check cache — if we have full story data, skip Jira entirely
-      const cached = getEpicCache(id);
-      if (cached && cached.data && cached.data.stories && cached.data.stories.length > 0) {
-        const cd = cached.data;
-        epicsMeta.push({ id, title: cd.epicMeta && cd.epicMeta.meta ? cd.epicMeta.meta.title : id });
-        fullCacheHits.push({ id, stories: cd.stories, title: cd.epicMeta && cd.epicMeta.meta ? cd.epicMeta.meta.title : id });
-        tcTotalChars += cd.charsProcessed || 0;
-        log(`✓ [CACHE HIT] ${id} — ${cd.stories.length} stories loaded from cache (${cached.cachedAt})`,'ok');
-        phase(1,'active',`${i+1} of ${epics.length}`);
-        continue;
-      }
-
       const epic=await client.withRetry(`getIssue(${id})`,()=>client.getIssue(id,['summary','description','status','issuetype']),CONFIG.mcp.maxRetries,log);
       const issueType = epic.fields.issuetype?.name || '';
       if (!['Epic','epic'].includes(issueType) && issueType !== '') {
@@ -1200,7 +1347,6 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
         return;
       }
       epicsMeta.push({id, title: epic.fields.summary});
-      tcTotalChars += (adfToPlainText(epic.fields.description)||'').length;
       log(`✓ ${id}: ${epic.fields.summary} [${issueType||'Epic'}]`,'ok');
       phase(1,'active',`${i+1} of ${epics.length}`);
     }
@@ -1210,15 +1356,7 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     phase(2,'active','');
     const storyListByEpic = {};
     let totalStories = 0;
-    // For cache-hit epics: record story count directly
-    fullCacheHits.forEach(ch => {
-      storyListByEpic[ch.id] = null; // sentinel: use cached data
-      totalStories += ch.stories.length;
-      log(`✓ ${ch.id}: ${ch.stories.length} stories (from cache)`,'ok');
-    });
-    const cacheHitIds = new Set(fullCacheHits.map(c=>c.id));
     for(const em of epicsMeta){
-      if(cacheHitIds.has(em.id)) continue;
       const jql=`parent in (${em.id}) AND issuetype = Story ORDER BY created ASC`;
       const sr=await client.withRetry(`stories(${em.id})`,()=>client.searchByJql(jql,['summary','status'],100),CONFIG.mcp.maxRetries,log);
       const rawIssues2=sr.issues||[];
@@ -1230,90 +1368,161 @@ app.post('/api/testcase/generate', authMiddleware, async (req, res) => {
     if(totalStories===0){ log(`⚠ No stories found — check epic IDs and Jira permissions`,'warn'); }
     phase(2,'done',`${totalStories} stories found`);
 
-    // ─── Phase 3: Fetch full story details ───────────────────────────────────
+    // ─── Phase 3: Fetch full story details (same as test plan) ───────────────
+    // Uses fetchStoriesParallel → each story gets: id, title, desc (full text), ac (extracted requirements)
     phase(3,'active',`0 of ${totalStories}`);
     const allEpics = [];
     let fetched = 0;
-    // Restore cache-hit epics first
-    for(const ch of fullCacheHits){
-      const emMeta = epicsMeta.find(e=>e.id===ch.id);
-      allEpics.push({
-        id: ch.id,
-        title: ch.title,
-        meta: { title: ch.title },
-        stories: ch.stories,
-        fromCache: true
-      });
-      fetched += ch.stories.length;
-    }
-    // Fetch from Jira for non-cache epics
     for(const em of epicsMeta){
-      if(cacheHitIds.has(em.id)) continue;
-      const list = storyListByEpic[em.id] || [];
+      const list = storyListByEpic[em.id];
       let stories = [];
       if(list.length>0){
         stories = await fetchStoriesParallel(client, list, log);
         fetched += stories.length;
         phase(3,'active',`${fetched} of ${totalStories}`);
+        // Log what we got
         stories.forEach(s => {
           log(`  ${s.id}: ${s.title.slice(0,50)} — ${s.desc.length} chars, ${s.ac.length} requirements`,'ok');
-          tcTotalChars += (s.desc||'').length;
         });
       }
-      allEpics.push({id:em.id, title:em.title, meta:{ title:em.title }, stories});
-      // Save to cache for next time
-      const epChars = stories.reduce((sum,s)=>sum+(s.desc||'').length,0);
-      setEpicCache(em.id, {
-        epicMeta: { id:em.id, meta:{ title:em.title } },
-        charsProcessed: epChars,
-        stories
-      });
+      allEpics.push({id:em.id, title:em.title, stories});
     }
-    phase(3,'done',`${totalStories} stories fetched`);
+    phase(3,'done',`${totalStories} stories fetched with full descriptions`);
 
     // ─── Phase 4: Fetch Confluence notes ─────────────────────────────────────
     phase(4,'active','');
     const confluenceByEpic = {};
     for(const em of epicsMeta){
       const conf = await fetchConfluenceForEpic(client, em.id, log).catch(()=>null);
-      if(conf){
-        confluenceByEpic[em.id]=conf;
-        log(`✓ Confluence: "${conf.title}"`,'ok');
-        // Attach to corresponding epic object for client use
-        const ep = allEpics.find(e=>e.id===em.id);
-        if(ep){ ep.confluenceContent=conf.content; ep.confluenceTitle=conf.title; }
-      } else {
-        log(`  No Confluence page for ${em.id}`,'info');
-      }
+      if(conf){ confluenceByEpic[em.id]=conf; log(`✓ Confluence: "${conf.title}"`,'ok'); }
+      else     { log(`  No Confluence page for ${em.id}`,'info'); }
     }
     phase(4,'done',`Confluence: ${Object.keys(confluenceByEpic).length} of ${epicsMeta.length} found`);
 
-    // ─── Phase 5: Prepare enriched data for client-side generation ────────────
-    // No AI call — the client uses buildFallbackCases() with the rule-based approach
-    // from the clearlyrated-test-case-creation skill (zero API tokens consumed).
-    phase(5,'active','Preparing data for client…');
-    const totalAcCount = allEpics.reduce((a,e)=>a+e.stories.reduce((b,s)=>b+(s.ac&&s.ac.length>0?s.ac.length:1),0),0);
-    const tcEstimatedTokens = Math.round(tcTotalChars / 4);
-    log(`✓ Data ready: ${totalStories} stories, ${totalAcCount} ACs, ~${tcEstimatedTokens.toLocaleString()} tokens equivalent`,'ok');
-    log(`✓ Test cases will be generated client-side using logic-based rules (0 API tokens)`,'ok');
-    phase(5,'done',`${totalStories} stories ready — client generating cases`);
+    // ─── Phase 5: Generate test cases via Claude AI ───────────────────────────
+    // Stories are processed in batches of 3 to keep each prompt manageable.
+    // This avoids token truncation which was causing JSON parse failures.
+    phase(5,'active','Calling Claude AI...');
+    log(`╔═══ AI TEST CASE GENERATION ═══`,'ok');
+    const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+    const generatedCases = [];
+    const BATCH_SIZE = 2;
 
-    log(`╚═══ DATA READY — sending to client for generation ═══`,'ok');
+    if(!ANTHROPIC_KEY){
+      log(`✗ ANTHROPIC_API_KEY not set on Render — cannot generate test cases`,'err');
+      log(`  Add it: Render → service → Environment → ANTHROPIC_API_KEY = sk-ant-...`,'warn');
+    } else {
+      let caseNum = 1;
+
+      for(const epic of allEpics){
+        const allStories = epic.stories||[];
+        if(!allStories.length){ log(`  Skipping ${epic.id} — no stories`,'warn'); continue; }
+
+        log(`  Epic: ${epic.title||epic.id} — ${allStories.length} stories, processing in batches of ${BATCH_SIZE}`,'ok');
+
+        const confData    = confluenceByEpic[epic.id] || null;
+        const confContent = confData ? confData.content : null;
+        const confTitle   = confData ? confData.title   : null;
+
+        // Split stories into batches
+        const batches = [];
+        for(let i=0; i<allStories.length; i+=BATCH_SIZE){
+          batches.push(allStories.slice(i, i+BATCH_SIZE));
+        }
+
+        for(let bi=0; bi<batches.length; bi++){
+          const batchStories = batches[bi];
+          const batchIds = batchStories.map(s=>s.id).join(', ');
+          log(`  Batch ${bi+1}/${batches.length}: ${batchIds}`,'info');
+
+          const prompt = buildServerTCPrompt(
+            epic.title||epic.id,
+            epic.id,
+            batchStories,
+            bi===0 ? confContent : null,  // only include Confluence in first batch
+            bi===0 ? confTitle   : null
+          );
+          log(`  Prompt: ${prompt.length} chars | ${batchStories.length} stories`,'info');
+
+          try {
+            const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
+              method:'POST',
+              headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
+              body: JSON.stringify({
+                model:      'claude-sonnet-4-6',
+                max_tokens: 16000,
+                system:     'You are a QA architect. Respond ONLY with a valid JSON array. No explanation, no preamble, no markdown fences. Start immediately with [ and end with ].',
+                messages:   [{role:'user', content: prompt}]
+              })
+            });
+
+            const aiData = await aiResp.json();
+            if(!aiResp.ok) throw new Error(`Anthropic API ${aiResp.status}: ${aiData.error?.message||JSON.stringify(aiData.error)}`);
+
+            const rawText = (aiData.content?.[0]?.text || '').trim();
+            log(`  Response: ${rawText.length} chars | tokens: ${aiData.usage?.input_tokens||'?'} in / ${aiData.usage?.output_tokens||'?'} out`,'ok');
+
+            // Robust JSON extraction — handles any whitespace or trailing text
+            let cleanRaw = rawText.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim();
+            const jsonStart = cleanRaw.indexOf('[');
+            const jsonEnd   = cleanRaw.lastIndexOf(']');
+            if(jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart){
+              throw new Error(`No JSON array found. Preview: ${rawText.slice(0,200)}`);
+            }
+            let jsonStr = cleanRaw.slice(jsonStart, jsonEnd+1);
+            // Attempt parse; if truncated, try to repair by closing open objects
+            let cases;
+            try {
+              cases = JSON.parse(jsonStr);
+            } catch(parseErr) {
+              // Response was truncated — try to recover partial cases
+              log(`  ⚠ JSON parse failed (likely truncation), attempting recovery...`,'warn');
+              // Find last complete object by splitting on },{ pattern
+              const lastComplete = jsonStr.lastIndexOf('},');
+              if(lastComplete > jsonStart) {
+                try { cases = JSON.parse(jsonStr.slice(0, lastComplete+1) + ']'); }
+                catch(e){ cases = []; }
+              } else { cases = []; }
+            }
+
+            if(!Array.isArray(cases) || !cases.length){
+              throw new Error(`Empty or invalid array. Raw: ${rawText.slice(0,200)}`);
+            }
+
+            cases.forEach(tc => {
+              generatedCases.push({
+                caseId:        `${prefix}-${String(caseNum++).padStart(3,'0')}`,
+                title:         (tc.title||`Validate ${epic.title||epic.id}`).trim(),
+                category:      tc.category || 'Positive Flows',
+                preconditions: (tc.preconditions||'').replace(/\n+/g,' ').trim(),
+                credentials:   tc.credentials || 'Account Manager',
+                stories:       tc.storyIds || batchStories.map(s=>s.id),
+                acRefs:        tc.acRefs || [],
+                steps:         (tc.steps||[]).map((s,si) => ({
+                  stepNum:        si+1,
+                  action:         (s.action||'').trim(),
+                  expectedResult: (s.expectedResult||s.expected||'').trim()
+                }))
+              });
+            });
+            log(`  ✓ Batch ${bi+1}: ${cases.length} test case(s)`,'ok');
+
+          } catch(aiErr) {
+            log(`  ✗ Batch ${bi+1} failed: ${aiErr.message}`,'err');
+          }
+        } // end batch loop
+      } // end epic loop
+    }
+
+    phase(5,'done',`${generatedCases.length} test cases generated`);
+    log(`╚═══ COMPLETE: ${generatedCases.length} test cases ═══`,'ok');
     send('complete',{
       projectName, release, epics, prefix,
       allEpics,
       totalStories,
       generatedBy:    req.user.fullName,
       site:           jira.siteUrl,
-      generatedCases: [],          // always empty — client generates all cases
-      dataStats: {
-        totalCharsProcessed: tcTotalChars,
-        estimatedTokens:     tcEstimatedTokens,
-        storiesFetched:      totalStories,
-        acCount:             totalAcCount,
-        cacheHits:           fullCacheHits.length,
-        apiTokensUsed:       0
-      }
+      generatedCases
     });
 
   } catch(err) {
@@ -1336,9 +1545,40 @@ app.post('/api/testcase/save', authMiddleware, async (req, res) => {
   }catch(err){res.status(500).json({error:err.message});}
 });
 
-// v1.4.0: AI endpoint removed — test cases generated client-side via buildFallbackCases()
-app.post('/api/testcase/ai', authMiddleware, (_req, res) => {
-  res.status(501).json({ error: 'AI generation removed — test cases are now generated client-side using logic-based rules' });
+// AI test case generation endpoint — calls Anthropic API server-side with API key
+app.post('/api/testcase/ai', authMiddleware, async (req, res) => {
+  const { prompt } = req.body || {};
+  if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+
+  try {
+    const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
+      method:  'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-6',
+        max_tokens: 16000,
+        messages:   [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (!aiResp.ok) {
+      const err = await aiResp.text();
+      return res.status(aiResp.status).json({ error: 'Anthropic API error: ' + err.slice(0, 200) });
+    }
+
+    const data = await aiResp.json();
+    const raw  = (data.content && data.content[0] && data.content[0].text) || '';
+    res.json({ text: raw });
+  } catch (err) {
+    res.status(500).json({ error: 'AI generation failed: ' + err.message });
+  }
 });
 
 app.get('/api/testcase/list', authMiddleware, async (req, res) => {
