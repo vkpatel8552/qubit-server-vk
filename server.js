@@ -1,8 +1,9 @@
 /**
- * qubit-server v1.4.0
+ * qubit-server v1.5.0
  * PostgreSQL-backed: users, sessions, connectors, test plans, stats
  * Email: Mailgun SMTP via nodemailer
- * v1.4: Epic cache, archive reset, logic-based TC generation, token tracking
+ * v1.5: Full TP epic cache (skip Phase 2 JQL + Phase 3 story fetch), archive v3 reset,
+ *       epic-cache dir wipe on migration, token stats always shown
  */
 'use strict';
 
@@ -123,7 +124,7 @@ async function db(sql, params = []) {
 }
 
 // Current schema version — bump to trigger a one-time archive purge on next deploy.
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 async function initDB() {
   await db(`CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, data JSONB NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())`);
@@ -160,6 +161,14 @@ async function initDB() {
     await db(`TRUNCATE TABLE test_cases RESTART IDENTITY CASCADE`).catch(e => db(`DELETE FROM test_cases`));
     await db(`TRUNCATE TABLE stat_events RESTART IDENTITY CASCADE`).catch(e => db(`DELETE FROM stat_events`));
     await db(`INSERT INTO schema_meta(key,value) VALUES('version','${SCHEMA_VERSION}') ON CONFLICT(key) DO UPDATE SET value='${SCHEMA_VERSION}'`);
+    // Also clear the epic-cache directory so stale Jira data is not served
+    try {
+      if (fs.existsSync(EPIC_CACHE_DIR)) {
+        const cacheFiles = fs.readdirSync(EPIC_CACHE_DIR);
+        cacheFiles.forEach(f => { try { fs.unlinkSync(path.join(EPIC_CACHE_DIR, f)); } catch(e){} });
+        console.log(`[db] Cleared ${cacheFiles.length} epic-cache file(s)`);
+      }
+    } catch(e) { console.warn('[db] Could not clear epic-cache:', e.message); }
     console.log('[db] Archive purged — starting fresh');
   }
 
@@ -948,15 +957,19 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
 
     phase(1,'active',`0 of ${epics.length}`);const epicsMeta=[];
     let totalCharsProcessed = 0;
+    const tpFullyCachedEpics = {}; // epicId → cached data (epic + stories) — skip Phases 2 & 3
+    let tpCacheHitCount = 0;
     for(let i=0;i<epics.length;i++){
       const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);
 
-      // ── Check epic cache first ────────────────────────────────────────────
+      // ── Check epic cache first (require stories — partial cache miss goes to Jira) ──
       const cached = getEpicCache(id);
-      if (cached && cached.data) {
+      if (cached && cached.data && cached.data.stories && cached.data.stories.length >= 0) {
         const cd = cached.data;
         epicsMeta.push(cd.epicMeta);
-        log(`✓ [CACHE HIT] ${id} loaded from local cache (${cached.cachedAt}) — skipped Jira fetch`,'ok');
+        tpFullyCachedEpics[id] = cd;
+        tpCacheHitCount++;
+        log(`✓ [FULL CACHE HIT] ${id} — epic + ${cd.stories.length} stories from cache (${cached.cachedAt}) — Jira fetch skipped`,'ok');
         totalCharsProcessed += cd.charsProcessed || 0;
         phase(1,'active',`${i+1} of ${epics.length}`);
         continue;
@@ -992,19 +1005,40 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     }
     phase(1,'done',`${epics.length} epics fetched`);phase(2,'active','');
     const slbe={};let totalStories=0;
-    for(const em of epicsMeta){const jql=`parent in (${em.id}) AND issuetype = Story`;log(`JQL: "${jql}"`);const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const rawIssues=sr.issues||[];
-        const skippedDev=rawIssues.filter(s=>isDevStory(s.fields&&s.fields.summary));
-        const issues=rawIssues.filter(s=>!isDevStory(s.fields&&s.fields.summary));
-        slbe[em.id]=issues;
-        // Store skipped stories for test plan "Notes" section
-        if(!slbe.__skipped) slbe.__skipped={};
-        if(skippedDev.length) slbe.__skipped[em.id]=skippedDev.map(s=>({key:s.key,summary:s.fields&&s.fields.summary}));
-        log(`✓ ${issues.length} stories for ${em.id}`+(skippedDev.length?` (${skippedDev.length} technical task stories skipped: ${skippedDev.map(s=>s.key).join(', ')})`:''),'ok');
-        issues.forEach(s=>log(`    • ${s.key} — ${s.fields&&s.fields.summary}`));
-        if(skippedDev.length) skippedDev.forEach(s=>log(`    ⊘ ${s.key} — ${s.fields&&s.fields.summary} [SKIPPED: Technical Task]`,'warn'));totalStories+=issues.length;}
+    for(const em of epicsMeta){
+      // ── Fully cached epic: skip JQL, use stored story list ──────────────────
+      if (tpFullyCachedEpics[em.id]) {
+        const cachedStories = tpFullyCachedEpics[em.id].stories;
+        slbe[em.id] = cachedStories.map(s=>({key:s.id,fields:{summary:s.title||''}}));
+        totalStories += cachedStories.length;
+        log(`✓ [CACHE] ${em.id}: ${cachedStories.length} stories from cache — JQL skipped`,'ok');
+        cachedStories.forEach(s=>log(`    • ${s.id} — ${s.title}`));
+        continue;
+      }
+      const jql=`parent in (${em.id}) AND issuetype = Story`;log(`JQL: "${jql}"`);const sr=await client.withRetry(`searchByJql(${em.id})`,()=>client.searchByJql(jql,['summary','status','issuetype'],100),CONFIG.mcp.maxRetries,log);const rawIssues=sr.issues||[];
+      const skippedDev=rawIssues.filter(s=>isDevStory(s.fields&&s.fields.summary));
+      const issues=rawIssues.filter(s=>!isDevStory(s.fields&&s.fields.summary));
+      slbe[em.id]=issues;
+      // Store skipped stories for test plan "Notes" section
+      if(!slbe.__skipped) slbe.__skipped={};
+      if(skippedDev.length) slbe.__skipped[em.id]=skippedDev.map(s=>({key:s.key,summary:s.fields&&s.fields.summary}));
+      log(`✓ ${issues.length} stories for ${em.id}`+(skippedDev.length?` (${skippedDev.length} technical task stories skipped: ${skippedDev.map(s=>s.key).join(', ')})`:''),'ok');
+      issues.forEach(s=>log(`    • ${s.key} — ${s.fields&&s.fields.summary}`));
+      if(skippedDev.length) skippedDev.forEach(s=>log(`    ⊘ ${s.key} — ${s.fields&&s.fields.summary} [SKIPPED: Technical Task]`,'warn'));
+      totalStories+=issues.length;
+    }
     phase(2,'done',`${totalStories} stories found`);if(totalStories===0)log(`⚠ No stories found. Check JQL permissions.`,'warn');
     phase(3,'active',`0 of ${totalStories}`);const allEpics=[];let done=0;
     for(const em of epicsMeta){
+      // ── Fully cached epic: skip story-detail fetch, use cached stories ──────────
+      if (tpFullyCachedEpics[em.id]) {
+        const details = tpFullyCachedEpics[em.id].stories;
+        allEpics.push({id:em.id,meta:em.meta,stories:details});
+        done += details.length;
+        log(`✓ [CACHE] ${em.id}: ${details.length} story details from cache — Jira fetch skipped`,'ok');
+        phase(3,'active',`${done} of ${totalStories}`);
+        continue;
+      }
       const list=slbe[em.id];
       const details=list.length>0?await fetchStoriesParallel(client,list,log):[];
       allEpics.push({id:em.id,meta:em.meta,stories:details});
@@ -1050,7 +1084,7 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       estimatedTokens,
       storiesFetched: totalStories,
       acCount: totalAcCount,
-      cacheHits: epics.filter(id=>{const c=getEpicCache(id);return c&&c.data&&c.data.stories;}).length
+      cacheHits: tpCacheHitCount
     };
     log(`✓ Data processed: ~${estimatedTokens.toLocaleString()} tokens equivalent (${totalCharsProcessed.toLocaleString()} chars, ${totalStories} stories, ${totalAcCount} ACs)`,'ok');
     send('complete',{planId,summary,skippedDevStories:skippedDevList,dataStats,stats:{epics:summary.totals.epics,stories:summary.totals.stories,scenarios:summary.totals.stories*4,ac:summary.totals.acceptanceCriteria}});
@@ -1364,7 +1398,7 @@ app.get('/api/test/mailgun', async (req, res) => {
 
 // HEALTH
 app.get('/api/health', (_req, res) => {
-  res.json({ok:true,service:'qubit-server',version:'1.4.0',uptimeSec:Math.round(process.uptime()),config:{allowedDomains:CONFIG.allowedDomains,googleClientId:CONFIG.googleClientId||null,database:process.env.DATABASE_URL?'postgresql':'⚠ not set',mcpTimeout:CONFIG.mcp.timeout}});
+  res.json({ok:true,service:'qubit-server',version:'1.5.0',uptimeSec:Math.round(process.uptime()),config:{allowedDomains:CONFIG.allowedDomains,googleClientId:CONFIG.googleClientId||null,database:process.env.DATABASE_URL?'postgresql':'⚠ not set',mcpTimeout:CONFIG.mcp.timeout}});
 });
 
 app.use((err,_req,res,_next)=>{console.error('Unhandled error:',err);res.status(500).json({error:'Internal server error',detail:err.message});});
