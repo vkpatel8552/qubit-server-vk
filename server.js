@@ -946,12 +946,77 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     try { fieldMap = await getFieldMap(client); log(`✓ Field mapping loaded (${Object.keys(fieldMap).length} fields)`,'ok'); }
     catch(e) { log(`⚠ Field mapping unavailable: ${e.message}`,'warn'); }
 
+
+    // ── PRE-CHECK: Does archive already have data for these epic IDs? ──────────
+    const archiveSummary = {};  // epicId → stored story data from DB
+    const ARCHIVE_TTL_DAYS = 7; // use archive if plan was generated within 7 days
+    try {
+      for (const id of epics) {
+        const ar = await db(
+          `SELECT summary, generated_at FROM test_plans WHERE email=$1 AND epics::text LIKE $2 ORDER BY generated_at DESC LIMIT 1`,
+          [req.user.email.toLowerCase(), `%"${id}"%`]
+        ).catch(() => ({ rows: [] }));
+        if (ar.rows[0] && ar.rows[0].summary) {
+          const planDate = new Date(ar.rows[0].generated_at);
+          const ageMs = Date.now() - planDate.getTime();
+          if (ageMs < ARCHIVE_TTL_DAYS * 24 * 60 * 60 * 1000) {
+            // Find this epic in the archived summary
+            const archEpics = ar.rows[0].summary.epics || [];
+            const archEpic = archEpics.find(e => (e.epicKey || e.id || '').toUpperCase() === id.toUpperCase());
+            if (archEpic && archEpic.stories && archEpic.stories.length > 0) {
+              archiveSummary[id] = archEpic;
+              log(`✓ [ARCHIVE HIT] ${id} — ${archEpic.stories.length} stories from archive (${planDate.toISOString().slice(0,10)}) — Jira fetch will be skipped`, 'ok');
+            }
+          }
+        }
+      }
+      const archiveHitCount = Object.keys(archiveSummary).length;
+      if (archiveHitCount > 0) {
+        log(`ℹ Using archive data for ${archiveHitCount}/${epics.length} epic(s) — only ${epics.length - archiveHitCount} epic(s) need Jira fetch`, 'info');
+      }
+    } catch(archErr) {
+      log(`⚠ Archive pre-check failed (${archErr.message}) — will fetch from Jira`, 'warn');
+    }
+
     phase(1,'active',`0 of ${epics.length}`);const epicsMeta=[];
     let totalCharsProcessed = 0;
     const tpFullyCachedEpics = {}; // epicId → cached data — skip Phases 2 & 3
     let tpCacheHitCount = 0;
     for(let i=0;i<epics.length;i++){
       const id=epics[i];log(`──── Epic ${i+1}/${epics.length}: ${id} ────`);
+      // ── Check DB archive first (higher priority than file cache) ────────────
+      if (archiveSummary[id]) {
+        const archEpic = archiveSummary[id];
+        // Convert archive format to epicsMeta format
+        const archMeta = {
+          id,
+          meta: {
+            title: archEpic.epicTitle || archEpic.title || id,
+            description: archEpic.epicDescription || '',
+            status: 'In Progress',
+            assignee: archEpic.epicAssignee || '—',
+            reporter: archEpic.epicReporter || '—',
+            qaTester: archEpic.epicQaValidator || summary?.generatedByName || '—',
+            productManager: archEpic.epicReporter || '—',
+            engineeringManager: archEpic.epicEngineeringManager || archEpic.epicAssignee || '—',
+            stakeholders: archEpic.epicStakeholders || [],
+            reviewers: [archEpic.epicReporter].filter(Boolean),
+            dueDate: new Date(Date.now()+5*86400000).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'}),
+          }
+        };
+        epicsMeta.push(archMeta);
+        // Store as fully cached so phases 2+3 skip too
+        tpFullyCachedEpics[id] = {
+          epicMeta: archMeta,
+          stories: archEpic.stories || [],
+          charsProcessed: (archEpic.stories||[]).reduce((n,s)=>n+(s.desc||'').length+(s.ac||[]).join('').length,0),
+        };
+        tpCacheHitCount++;
+        totalCharsProcessed += tpFullyCachedEpics[id].charsProcessed;
+        log(`✓ [ARCHIVE] ${id}: ${archEpic.stories.length} stories loaded from archive — Jira skipped`, 'ok');
+        phase(1, 'active', `${i+1} of ${epics.length}`);
+        continue;
+      }
       // ── Check epic cache first ──────────────────────────────────────────────
       const cached = getEpicCache(id);
       if (cached && cached.data && cached.data.stories && cached.data.stories.length >= 0) {
@@ -1093,6 +1158,410 @@ app.get('/api/testplan/by-epics', authMiddleware, async (req, res) => {
 app.get('/api/testplan/list', authMiddleware, async (req, res) => {
   const plans=await getPlans(req.user.email);res.json({plans});
 });
+
+// DOCX EXPORT — generate proper .docx from planData
+app.post('/api/testplan/export-docx', authMiddleware, async (req, res) => {
+  const { summary } = req.body || {};
+  if (!summary) return res.status(400).json({ error: 'summary required' });
+  try {
+    // Dynamically require docx (install if needed)
+    let docx;
+    try { docx = require('docx'); } catch(e) {
+      const { execSync } = require('child_process');
+      execSync('npm install docx --no-save', { cwd: __dirname, stdio: 'pipe' });
+      docx = require('docx');
+    }
+    const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType, HeadingLevel, BorderStyle, ShadingType, ExternalHyperlink } = docx;
+
+    // Style constants (from clearlyrated-test-plan skill styles.js)
+    const S = {
+      COLORS: { BRAND_BLUE:'0052CC', TABLE_HEADER:'F4F5F7', ROW_WHITE:'FFFFFF', TEXT_HEADING:'172B4D', TEXT_BODY:'333333',
+                MUST_HAVE:'E3FCEF', NICE_TO_HAVE:'FFFAE6', NOT_IN_SCOPE:'FFEBE6',
+                STATUS_DONE:'36B37E', STATUS_PENDING:'FF5630', TEXT_LINK:'0052CC' },
+      FONTS: { FAMILY:'Calibri', TITLE:40, SUBTITLE:24, H2:28, BODY:20, SMALL:18 },
+      TABLES: {
+        OVERVIEW: { LABEL:2485, VALUE:7595 },
+        SCOPE:    { CATEGORY:1466, CONTENT:8614 },
+        SCENARIO: { STORY_ID:1773, DATA_SETUP:1620, DESCRIPTION:6687 },
+        MILESTONES:{ MILESTONE:3196, RESPONSIBLE:3290, DATE:1884, STATUS:1710 },
+      },
+      PAD: { top:56, bottom:56, left:113, right:113 },
+      shading(hex){ return { type: ShadingType.CLEAR, color:'auto', fill:hex }; },
+      border(){ const b={style:BorderStyle.SINGLE,size:4,color:'C1C7D0'}; return {top:b,bottom:b,left:b,right:b,insideH:b,insideV:b}; },
+    };
+
+    function cell(text, opts={}) {
+      const { bg=S.COLORS.ROW_WHITE, bold=false, color=S.COLORS.TEXT_BODY, size=S.FONTS.BODY, colSpan, rowSpan, width } = opts;
+      const children = Array.isArray(text) ? text : [new Paragraph({ children: [new TextRun({ text: String(text||''), bold, color, size, font: S.FONTS.FAMILY })] })];
+      return new TableCell({
+        ...(colSpan ? { columnSpan: colSpan } : {}),
+        ...(rowSpan ? { rowSpan } : {}),
+        ...(width ? { width: { size: width, type: WidthType.DXA } } : {}),
+        shading: S.shading(bg),
+        borders: S.border(),
+        margins: S.PAD,
+        children,
+      });
+    }
+
+    function hdrCell(text, width) {
+      return cell(text, { bg: S.COLORS.TABLE_HEADER, bold: true, color: S.COLORS.TEXT_HEADING, size: S.FONTS.BODY, width });
+    }
+
+    function sectionHeading(label) {
+      const emojiMap = {'Objective':'\u{1F3AF}','Scope':'\u{1F4CB}','Roles and Responsibility':'\u{1F465}','Test Strategy Overview':'\u{1F4CA}',
+        'Testing Phases and Cycles':'\u{1F504}','Assumptions':'⚙️','Test Scenarios':'\u{1F50E}','Entry and Exit Criteria':'✅',
+        'Test Tools':'\u{1F6E0}️','Test Environment':'\u{1F310}','Milestones and Deadlines':'\u{1F4C5}','Risks and Mitigations':'⚠️',
+        'Test Deliverables':'\u{1F4E6}','Reference Materials':'\u{1F4DA}'};
+      const emoji = emojiMap[label] || '';
+      const bold = label !== 'Reference Materials';
+      return new Paragraph({
+        heading: HeadingLevel.HEADING_2,
+        spacing: { after: 120 },
+        children: [new TextRun({ text: (emoji ? emoji + '  ' : '') + label, bold, color: S.COLORS.TEXT_HEADING, size: S.FONTS.H2, font: S.FONTS.FAMILY })],
+      });
+    }
+
+    function bodyPara(text, bold=false) {
+      return new Paragraph({ spacing: { after: 80 }, children: [new TextRun({ text, bold, color: S.COLORS.TEXT_BODY, size: S.FONTS.BODY, font: S.FONTS.FAMILY })] });
+    }
+
+    function bulletPara(text, level=0) {
+      return new Paragraph({ bullet: { level }, spacing: { after: 40 }, children: [new TextRun({ text, color: S.COLORS.TEXT_BODY, size: S.FONTS.BODY, font: S.FONTS.FAMILY })] });
+    }
+
+    // Parse summary
+    const epics = summary.epics || [];
+    const primaryMeta = epics[0] || {};
+    const allStories = epics.flatMap(e => (e.stories || []).map(s => ({ ...s, epicId: e.epicKey || e.id })));
+    const epicTitle = primaryMeta.epicTitle || primaryMeta.title || 'Test Plan';
+    const epicKeys = epics.map(e => e.epicKey || e.id).filter(Boolean);
+    const jiraSite = summary.site || 'clearlyrated.atlassian.net';
+    const qaTester = epics[0]?.epicQaValidator || summary.generatedByName || summary.generatedBy || 'QA Tester';
+    const pm = epics[0]?.epicReporter || '—';
+    const em = epics[0]?.epicEngineeringManager || epics[0]?.epicAssignee || '—';
+    const today = new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+    const dueDate = new Date(Date.now()+5*86400000).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+
+    const children = [];
+
+    // §1 Title block
+    children.push(new Paragraph({
+      spacing: { before: 0, after: 40 },
+      shading: S.shading(S.COLORS.BRAND_BLUE),
+      children: [new TextRun({ text: 'Test Plan — ' + epicTitle, bold: true, color: S.COLORS.ROW_WHITE, size: S.FONTS.TITLE, font: S.FONTS.FAMILY })],
+    }));
+    children.push(new Paragraph({
+      spacing: { after: 20 },
+      shading: S.shading(S.COLORS.BRAND_BLUE),
+      children: [new TextRun({ text: 'Epic: ' + epicKeys.join(', ') + '  |  Version: 1.0  |  Status: In Progress', color: 'E8E8E8', size: S.FONTS.SUBTITLE, font: S.FONTS.FAMILY })],
+    }));
+    children.push(new Paragraph({
+      spacing: { after: 160 },
+      shading: S.shading(S.COLORS.BRAND_BLUE),
+      children: [new TextRun({ text: '\u{1F464} Prepared by: ' + qaTester + '   \u{1F4C5} ' + today, color: 'E8E8E8', size: S.FONTS.BODY, font: S.FONTS.FAMILY })],
+    }));
+
+    // Overview table
+    const overviewRows = [
+      ['Project Name', summary.project || '—'],
+      ['Epic', epicKeys.join(', ')],
+      ['Description', epics.map(e => e.epicDescription || e.epicTitle || '').join('; ').slice(0, 300) || '—'],
+      ['Stakeholders', (epics[0]?.epicStakeholders || [pm, em]).filter(Boolean).join(', ') || '—'],
+      ['Reviewers', pm || '—'],
+      ['Due Date', dueDate],
+      ['QA Tester', qaTester],
+      ['Status', 'In Progress'],
+    ];
+    children.push(new Table({
+      width: { size: 10080, type: WidthType.DXA },
+      rows: overviewRows.map(([lbl, val]) => new TableRow({ children: [
+        cell(lbl, { bg:S.COLORS.TABLE_HEADER, bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, width:S.TABLES.OVERVIEW.LABEL }),
+        cell(val, { width:S.TABLES.OVERVIEW.VALUE }),
+      ]})),
+    }));
+    children.push(new Paragraph({ spacing: { after: 160 } }));
+
+    // §2 Objective
+    children.push(sectionHeading('Objective'));
+    children.push(bodyPara(`The objective of this test plan is to ensure comprehensive QA coverage for ${epicKeys.join(', ')}: "${epicTitle}". It defines the scope, strategy, test scenarios, and deliverables for validating all stories, acceptance criteria, and edge cases. The plan follows ClearlyRated's QA framework, prioritizing positive paths, error handling, edge cases, permissions, and regression coverage across affected modules.`));
+    children.push(new Paragraph({ spacing: { after: 160 } }));
+
+    // §3 Scope
+    children.push(sectionHeading('Scope'));
+    const scopeData = [
+      { bg: S.COLORS.MUST_HAVE, label: 'Must have:', color:'006644' },
+      { bg: S.COLORS.NICE_TO_HAVE, label: 'Nice to have:', color:'974F0C' },
+      { bg: S.COLORS.NOT_IN_SCOPE, label: 'Not in scope:', color:'BF2600' },
+    ];
+    const scopeStories = allStories.map(s => s.id + ' — ' + s.title);
+    const scopeRows = scopeData.map((row, ri) => new TableRow({ children: [
+      cell(row.label, { bg: row.bg, bold:true, color: row.color, width: S.TABLES.SCOPE.CATEGORY }),
+      new TableCell({
+        width: { size: S.TABLES.SCOPE.CONTENT, type: WidthType.DXA },
+        shading: S.shading(S.COLORS.ROW_WHITE),
+        borders: S.border(),
+        margins: S.PAD,
+        children: ri === 0
+          ? scopeStories.map(s => bulletPara(s))
+          : ri === 1
+            ? [bulletPara('Additional accessibility improvements beyond WCAG 2.1 AA baseline'), bulletPara('Performance optimizations for edge-case data volumes')]
+            : [bulletPara("Items explicitly outside this epic's boundaries"), bulletPara('Future-release enhancements documented in subsequent epics'), bulletPara('Third-party service internals (only integration points tested)')],
+      }),
+    ]}));
+    children.push(new Table({ width: { size: 10080, type: WidthType.DXA }, rows: scopeRows }));
+    children.push(new Paragraph({ spacing: { after: 160 } }));
+
+    // §4 Roles
+    children.push(sectionHeading('Roles and Responsibility'));
+    [['Product Manager', pm],['Engineering Manager', em],['Feature Developer', (epics[0]?.epicAssignee ? epics[0].epicAssignee + ' and Team' : '—')],['Test Developer', qaTester],['Automation Tester', qaTester]].forEach(([role, name]) => {
+      children.push(new Paragraph({ spacing: { after: 80 }, children: [
+        new TextRun({ text: role + ':  ', bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY }),
+        new TextRun({ text: name, color:S.COLORS.TEXT_BODY, size:S.FONTS.BODY, font:S.FONTS.FAMILY }),
+      ]}));
+    });
+    children.push(new Paragraph({ spacing: { after: 160 } }));
+
+    // §5 Test Strategy
+    children.push(sectionHeading('Test Strategy Overview'));
+    [
+      'The test strategy describes the foundation for how testing will be managed and executed throughout the project. It focuses on iterative testing cycles, strategic planning, and continuous improvement to ensure the highest quality standards.',
+      'Agile Methodology: Testing is integrated into each development cycle, with test runs conducted at regular intervals. This approach allows for early detection of issues and continuous validation as new features are developed.',
+      'Risk-Based Testing: Testing efforts are prioritized based on risk assessments. High-risk areas are tested extensively within each cycle, ensuring that critical components are thoroughly validated.',
+      'Quality Metrics: Success is measured through key quality metrics, including defect rates, test coverage, and performance benchmarks.',
+      'Collaboration and Communication: The strategy emphasizes close collaboration across teams, with regular meetings and transparent reporting.',
+      'Continuous Improvement: Feedback from each test cycle is used to refine both the product and the testing process.',
+    ].forEach(t => children.push(bodyPara(t)));
+    children.push(new Paragraph({ spacing: { after: 160 } }));
+
+    // §6 Testing Phases
+    children.push(sectionHeading('Testing Phases and Cycles'));
+    children.push(bodyPara('This project includes below testing phases:'));
+    children.push(new Paragraph({ spacing:{after:80}, children:[new TextRun({text:'System Testing', bold:true, color:S.COLORS.TEXT_BODY, size:S.FONTS.BODY, font:S.FONTS.FAMILY}), new TextRun({text:' - To Ensure all functional and non-functional scenarios are covered as per epic', color:S.COLORS.TEXT_BODY, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+    children.push(new Paragraph({ spacing:{after:160}, children:[new TextRun({text:'Regression Testing', bold:true, color:S.COLORS.TEXT_BODY, size:S.FONTS.BODY, font:S.FONTS.FAMILY}), new TextRun({text:' - To Ensure there is no impact on existing functionality of the feature and related navigation modules', color:S.COLORS.TEXT_BODY, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+
+    // §7 Assumptions
+    children.push(sectionHeading('Assumptions'));
+    ['Testing will be performed in the Dev environment unless otherwise stated.',
+     'Defects will be logged in Jira and assigned appropriate severity.',
+     'Feature is deployed and accessible in Dev before test execution begins.',
+     `Existing ${epicTitle} functionality will continue to work as expected (regression baseline confirmed).`,
+     'At least one qualifying test data record exists in each state required by the scenarios prior to execution.',
+     'Backend APIs return deterministic, correctly computed responses for all test conditions.',
+     'Test data will be prepared and seeded by the QA team before execution begins.',
+    ].forEach(a => children.push(bulletPara(a)));
+    children.push(new Paragraph({ spacing: { after: 160 } }));
+
+    // §8 Test Scenarios
+    children.push(sectionHeading('Test Scenarios'));
+
+    const scenarioRows = [];
+    scenarioRows.push(new TableRow({ children: [cell('Must Have', { bg:S.COLORS.MUST_HAVE, bold:true, color:'006644', colSpan:3 })] }));
+    scenarioRows.push(new TableRow({ children: [
+      hdrCell('Story ID', S.TABLES.SCENARIO.STORY_ID),
+      hdrCell('Data Setup Requirement', S.TABLES.SCENARIO.DATA_SETUP),
+      hdrCell('Scenario Description', S.TABLES.SCENARIO.DESCRIPTION),
+    ]}));
+
+    allStories.forEach(function(s) {
+      const ac = s.ac || [];
+      const storyAction = (s.title||'').replace(/^(navigation\s*[-:—]\s*|display\s*[-:—]\s*|build\s*[-:—]\s*|render\s*[-:—]\s*|implement\s*[-:—]\s*|create\s*[-:—]\s*)/i,'').trim();
+
+      const posACs = ac.filter(a => !/error|fail|invalid|cannot|must not|block|prevent/.test(a.toLowerCase()));
+      const negACs = ac.filter(a => /error|fail|invalid|cannot|must not|block|prevent/.test(a.toLowerCase()));
+      const permACs= ac.filter(a => /role|permission|access|admin|manager|hidden|restricted/.test(a.toLowerCase()));
+      const edgeACs= ac.filter(a => /max|min|limit|empty|null|zero|boundary/.test(a.toLowerCase()));
+
+      const scenarios = [];
+
+      if (posACs.length > 0 || ac.length > 0) {
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' works correctly when feature is accessed in normal state',
+          items: (posACs.length > 0 ? posACs : ac).slice(0,6),
+          dataSetup: 'Test account configured in Dev environment\nLogin: Account Manager',
+        });
+      }
+      if (negACs.length > 0) {
+        scenarios.push({
+          heading: 'Validate error handling when invalid conditions or failure states occur for ' + storyAction.toLowerCase(),
+          items: negACs.slice(0,5),
+          dataSetup: 'Test data with invalid/edge state\nDev environment',
+        });
+      }
+      if (permACs.length > 0) {
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' is accessible or restricted correctly when user role is evaluated',
+          items: permACs.slice(0,5),
+          dataSetup: 'Multiple user roles available: Admin, Manager, Standard User',
+        });
+      }
+      if (edgeACs.length >= 1) {
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' handles boundary values correctly when edge-case inputs are provided',
+          items: edgeACs.slice(0,4),
+          dataSetup: 'Boundary-value test data prepared\nDev environment',
+        });
+      }
+      if (scenarios.length === 0) {
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' when feature is exercised in standard conditions',
+          items: ['Verify the feature renders without errors', 'Confirm core behaviour matches requirements'],
+          dataSetup: 'Test account configured in Dev environment',
+        });
+      }
+
+      const storyKey = s.id || '';
+      const storyTitle = s.title || '';
+
+      scenarios.forEach(function(sc, si) {
+        const bulletParas = [
+          new Paragraph({ spacing:{after:60}, children:[new TextRun({text:sc.heading, bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})] }),
+          ...sc.items.map(item => new Paragraph({ bullet:{level:0}, spacing:{after:40}, children:[new TextRun({text:item.replace(/^[\s•\-→>]+/,'').trim(), color:S.COLORS.TEXT_BODY, size:S.FONTS.BODY, font:S.FONTS.FAMILY})] }))
+        ];
+
+        const dataSetupParas = (sc.dataSetup||'').split('\n').map(l => new Paragraph({ spacing:{after:40}, children:[new TextRun({text:l.trim(), color:S.COLORS.TEXT_BODY, size:S.FONTS.SMALL, font:S.FONTS.FAMILY})] }));
+
+        const row = new TableRow({ children: [
+          ...(si === 0 ? [new TableCell({
+            rowSpan: scenarios.length,
+            width:{ size:S.TABLES.SCENARIO.STORY_ID, type:WidthType.DXA },
+            shading: S.shading(S.COLORS.TABLE_HEADER),
+            borders: S.border(),
+            margins: S.PAD,
+            children: [
+              new Paragraph({ spacing:{after:4}, children:[new TextRun({text: storyKey, bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})] }),
+              new Paragraph({ spacing:{after:0}, children:[new TextRun({text: storyTitle, color:S.COLORS.TEXT_BODY, size:S.FONTS.SMALL, font:S.FONTS.FAMILY})] }),
+            ],
+          })] : []),
+          new TableCell({
+            width:{ size:S.TABLES.SCENARIO.DATA_SETUP, type:WidthType.DXA },
+            shading: S.shading(S.COLORS.TABLE_HEADER),
+            borders: S.border(),
+            margins: S.PAD,
+            children: dataSetupParas,
+          }),
+          new TableCell({
+            width:{ size:S.TABLES.SCENARIO.DESCRIPTION, type:WidthType.DXA },
+            shading: S.shading(S.COLORS.ROW_WHITE),
+            borders: S.border(),
+            margins: S.PAD,
+            children: bulletParas,
+          }),
+        ]});
+        scenarioRows.push(row);
+      });
+    });
+
+    children.push(new Table({ width:{ size:10080, type:WidthType.DXA }, rows: scenarioRows }));
+    children.push(new Paragraph({ spacing:{ after:160 } }));
+
+    // §9 Entry/Exit Criteria
+    children.push(sectionHeading('Entry and Exit Criteria'));
+    children.push(new Paragraph({ spacing:{after:80}, children:[new TextRun({text:'Entry Criteria:', bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+    ['Test Environment Setup is Complete: The testing environment is fully configured, and all necessary tools and systems are operational.',
+     'Test Cases are Reviewed and Approved: All test cases have been reviewed and approved.',
+     'New Feature Available for Testing: Access to the new feature is confirmed in the Dev Environment.'
+    ].forEach(t => children.push(bulletPara(t)));
+    children.push(new Paragraph({ spacing:{after:80}, children:[new TextRun({text:'Exit Criteria:', bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+    ['All Critical and High-Priority Defects are Resolved.',
+     'Test Cases Executed with a Pass Rate of at least 95%.',
+     'Acceptance Criteria Met for User Experience and Performance Standards.'
+    ].forEach(t => children.push(bulletPara(t)));
+    children.push(new Paragraph({ spacing:{ after:160 } }));
+
+    // §10 Test Tools
+    children.push(sectionHeading('Test Tools'));
+    children.push(bodyPara('Test tools are supporting tools which help us perform manual and automation testing, track the progress and manage defects raised during testing.'));
+    ['Transportal Server: https://transportal.dev.inavero.xyz/','Pilot Server: https://pilot.dev.inavero.xyz/',
+     'Testing Progress: JIRA-Kanban','Defect Management: JIRA','Test Management: Microsoft Excel'
+    ].forEach(t => children.push(bulletPara(t)));
+    children.push(new Paragraph({ spacing:{ after:160 } }));
+
+    // §11 Test Environment
+    children.push(sectionHeading('Test Environment'));
+    children.push(bodyPara('A test environment is the physical setup that combines specific configurations of these resources to create real-world testing scenarios.'));
+    children.push(bulletPara('Browsers: Chrome v131.0 or later'));
+    children.push(new Paragraph({ spacing:{ after:160 } }));
+
+    // §12 Milestones
+    children.push(sectionHeading('Milestones and Deadlines'));
+    const milestoneData = [
+      ['Test Planning and Creation', qaTester, today, 'Done'],
+      ['Test Plan Sign-Off', pm, dueDate, 'Pending'],
+      ['Test Case Design & Review', qaTester, '—', 'Pending'],
+      ['Test Execution', qaTester, '—', 'Pending'],
+      ['Defect Resolution', em, '—', 'Pending'],
+      ['Test Regression', qaTester, '—', 'Pending'],
+      ['Test Closer Report', qaTester, '—', 'Pending'],
+    ];
+    const mRows = [
+      new TableRow({ children: [hdrCell('Milestone',3196), hdrCell('Owner',3290), hdrCell('Deadline',1884), hdrCell('Status',1710)] }),
+      ...milestoneData.map(([m,o,d,st]) => new TableRow({ children: [
+        cell(m,{width:3196}), cell(o,{width:3290}), cell(d,{width:1884}),
+        new TableCell({ width:{size:1710,type:WidthType.DXA}, shading:S.shading(S.COLORS.ROW_WHITE), borders:S.border(), margins:S.PAD,
+          children:[new Paragraph({children:[new TextRun({text:st, bold:true, color:st==='Done'?S.COLORS.STATUS_DONE:S.COLORS.STATUS_PENDING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]})]
+        })
+      ]}))
+    ];
+    children.push(new Table({ width:{size:10080,type:WidthType.DXA}, rows:mRows }));
+    children.push(new Paragraph({ spacing:{ after:160 } }));
+
+    // §13 Risks
+    children.push(sectionHeading('Risks and Mitigations'));
+    children.push(new Paragraph({ spacing:{after:80}, children:[new TextRun({text:'Risks:', bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+    ['Potential delays in preparing testing environment or any uncertain issue while accessing those environments.',
+     'Unforeseen technical issues such as application not accessible or build issues that could affect the project.'
+    ].forEach(t => children.push(bulletPara(t)));
+    children.push(new Paragraph({ spacing:{after:80}, children:[new TextRun({text:'Mitigations:', bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+    ['Allocate extra time in the schedule to account for unforeseen delays in preparations.',
+     'Equip the project with backup plans and contingency measures to address potential challenges.'
+    ].forEach(t => children.push(bulletPara(t)));
+    children.push(new Paragraph({ spacing:{ after:160 } }));
+
+    // §14 Deliverables
+    children.push(sectionHeading('Test Deliverables'));
+    children.push(new Paragraph({ spacing:{after:60}, children:[new TextRun({text:'Before Testing:', bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+    ['Test Plan Document: Detailed test plan, including scope, objectives, strategy, and resources.',
+     'Test Cases: Specific test cases for each feature, outlining the steps and expected results.',
+     'Test Data: Prepared data sets for testing various scenarios.',
+     'Test Environment Setup: Configuration of servers, databases, and other necessary components.'
+    ].forEach(t => children.push(bulletPara(t)));
+    children.push(new Paragraph({ spacing:{after:60}, children:[new TextRun({text:'During Testing:', bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+    ['Track Progress: Records of all test cases executed, including pass/fail status.',
+     'Defect Reports: Documentation of any issues found, including steps to reproduce.',
+     'Daily/Weekly Status Reports: Updates on testing progress, including completed tests and open defects.'
+    ].forEach(t => children.push(bulletPara(t)));
+    children.push(new Paragraph({ spacing:{after:60}, children:[new TextRun({text:'After Testing:', bold:true, color:S.COLORS.TEXT_HEADING, size:S.FONTS.BODY, font:S.FONTS.FAMILY})]}));
+    ['Final Test Report: Summary of testing activities, including overall test coverage and recommendations.',
+     'Defect Log: Comprehensive list of all identified defects and their resolution status.',
+     'Test Closure Report: Document indicating all planned tests have been completed.'
+    ].forEach(t => children.push(bulletPara(t)));
+    children.push(new Paragraph({ spacing:{ after:160 } }));
+
+    // §15 References
+    children.push(sectionHeading('Reference Materials'));
+    children.push(bodyPara('Epic Links:'));
+    epicKeys.forEach(k => children.push(bulletPara(k + ': https://' + jiraSite + '/browse/' + k)));
+    children.push(bodyPara('Story Links:'));
+    allStories.forEach(s => children.push(bulletPara((s.id||'?') + ': https://' + jiraSite + '/browse/' + (s.id||''))));
+    children.push(bulletPara('Reference Test Plan: https://clearlyrated.atlassian.net/wiki/spaces/DEV/pages/2972745732'));
+
+    // Build and send the document
+    const doc = new Document({
+      sections: [{ properties: { page: { margin: { top: 1080, bottom: 1080, left: 1080, right: 1080 } } }, children }],
+    });
+
+    const buffer = await Packer.toBuffer(doc);
+    const epicStr = epicKeys.join('_').replace(/[^A-Z0-9_-]/gi, '_') || 'TestPlan';
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition', `attachment; filename="TestPlan_${epicStr}.docx"`);
+    res.send(buffer);
+  } catch(err) {
+    console.error('[docx-export]', err);
+    res.status(500).json({ error: 'docx generation failed: ' + err.message });
+  }
+});
+
 
 
 // TEST CASE — GENERATE (SSE: fetch Jira data, frontend generates cases)
