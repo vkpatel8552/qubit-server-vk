@@ -964,8 +964,14 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
             const archEpics = ar.rows[0].summary.epics || [];
             const archEpic = archEpics.find(e => (e.epicKey || e.id || '').toUpperCase() === id.toUpperCase());
             if (archEpic && archEpic.stories && archEpic.stories.length > 0) {
-              archiveSummary[id] = archEpic;
-              log(`✓ [ARCHIVE HIT] ${id} — ${archEpic.stories.length} stories from archive (${planDate.toISOString().slice(0,10)}) — Jira fetch will be skipped`, 'ok');
+              // Only use archive data if it has ACs — otherwise fall through to fresh Jira fetch
+              const archAcCount = archEpic.stories.reduce((t,s) => t + (s.acceptanceCriteria||s.ac||[]).length, 0);
+              if (archAcCount > 0) {
+                archiveSummary[id] = archEpic;
+                log(`✓ [ARCHIVE HIT] ${id} — ${archEpic.stories.length} stories, ${archAcCount} ACs from archive (${planDate.toISOString().slice(0,10)}) — Jira skipped`, 'ok');
+              } else {
+                log(`ℹ [ARCHIVE] ${id} — found but stored ACs=0, fetching fresh from Jira`, 'warn');
+              }
             }
           }
         }
@@ -1109,15 +1115,15 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
     }
     phase(3,'done',`${totalStories} stories enriched`);
 
-    // ── Validate: block generation if 0 ACs found across all stories ─────────
+    // ── AC coverage check — warn on missing ACs but never block generation ────
     const totalStoriesFound = allEpics.reduce((t,e)=>t+e.stories.length, 0);
     const totalACsFound = allEpics.reduce((t,e)=>t+e.stories.reduce((s2,s)=>s2+(s.ac&&s.ac.length>0?s.ac.length:0),0), 0);
-    if (totalStoriesFound > 0 && totalACsFound === 0) {
-      log(`╚═══ BLOCKED: 0 acceptance criteria found across ${totalStoriesFound} stories ═══`,'err');
-      log(`Add ACs to your Jira stories (Acceptance Criteria field) and regenerate the test plan.`,'err');
-      throw new Error(`0 acceptance criteria found across ${totalStoriesFound} stories. Define ACs in Jira before generating a test plan.`);
+    const storiesMissingAC = allEpics.flatMap(e=>e.stories.filter(s=>!s.ac||s.ac.length===0).map(s=>s.id));
+    if (storiesMissingAC.length > 0) {
+      log(`⚠ ${storiesMissingAC.length} stories have no ACs (fallback scenarios will be used): ${storiesMissingAC.join(', ')}`, 'warn');
+    } else {
+      log(`✓ AC coverage: ${totalACsFound} ACs across ${totalStoriesFound} stories`, 'ok');
     }
-    log(`✓ AC validation: ${totalACsFound} ACs across ${totalStoriesFound} stories`,'ok');
 
     phase(4,'active','saving to database');
     const planId=crypto.randomBytes(8).toString('hex');
