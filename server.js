@@ -1005,11 +1005,19 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
           }
         };
         epicsMeta.push(archMeta);
-        // Store as fully cached so phases 2+3 skip too
+        // Normalize archive story format {storyKey,storyTitle,fullDescription,acceptanceCriteria}
+        // → pipeline format {id,title,desc,ac} so summary builder and genScenarios work correctly
+        const normalizedStories = (archEpic.stories || []).map(s => ({
+          id:    s.id    || s.storyKey   || '',
+          title: s.title || s.storyTitle || '',
+          desc:  s.desc  || s.fullDescription || s.description || '',
+          ac:    s.ac    || s.acceptanceCriteria || [],
+          storyType: s.storyType || '',
+        }));
         tpFullyCachedEpics[id] = {
           epicMeta: archMeta,
-          stories: archEpic.stories || [],
-          charsProcessed: (archEpic.stories||[]).reduce((n,s)=>n+(s.desc||'').length+(s.ac||[]).join('').length,0),
+          stories: normalizedStories,
+          charsProcessed: normalizedStories.reduce((n,s)=>n+(s.desc||'').length+(s.ac||[]).join('').length, 0),
         };
         tpCacheHitCount++;
         totalCharsProcessed += tpFullyCachedEpics[id].charsProcessed;
@@ -1099,7 +1107,19 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
       setEpicCache(em.id, { epicMeta: em, charsProcessed: (em.meta.description||'').length + storyChars, stories: details });
       phase(3,'active',`${done} of ${totalStories}`);
     }
-    phase(3,'done',`${totalStories} stories enriched`);phase(4,'active','saving to database');
+    phase(3,'done',`${totalStories} stories enriched`);
+
+    // ── Validate: block generation if 0 ACs found across all stories ─────────
+    const totalStoriesFound = allEpics.reduce((t,e)=>t+e.stories.length, 0);
+    const totalACsFound = allEpics.reduce((t,e)=>t+e.stories.reduce((s2,s)=>s2+(s.ac&&s.ac.length>0?s.ac.length:0),0), 0);
+    if (totalStoriesFound > 0 && totalACsFound === 0) {
+      log(`╚═══ BLOCKED: 0 acceptance criteria found across ${totalStoriesFound} stories ═══`,'err');
+      log(`Add ACs to your Jira stories (Acceptance Criteria field) and regenerate the test plan.`,'err');
+      throw new Error(`0 acceptance criteria found across ${totalStoriesFound} stories. Define ACs in Jira before generating a test plan.`);
+    }
+    log(`✓ AC validation: ${totalACsFound} ACs across ${totalStoriesFound} stories`,'ok');
+
+    phase(4,'active','saving to database');
     const planId=crypto.randomBytes(8).toString('hex');
     const firstEpicTitle = allEpics[0] && allEpics[0].meta.title ? allEpics[0].meta.title : '';
     const displayName = `${projectName}${firstEpicTitle ? ' — ' + firstEpicTitle : ''}`;
