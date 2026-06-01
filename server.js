@@ -996,7 +996,7 @@ app.post('/api/testplan/generate', authMiddleware, async (req, res) => {
             status: 'In Progress',
             assignee: archEpic.epicAssignee || '—',
             reporter: archEpic.epicReporter || '—',
-            qaTester: archEpic.epicQaValidator || summary?.generatedByName || '—',
+            qaTester: archEpic.epicQaValidator || req.user.email || '—',
             productManager: archEpic.epicReporter || '—',
             engineeringManager: archEpic.epicEngineeringManager || archEpic.epicAssignee || '—',
             stakeholders: archEpic.epicStakeholders || [],
