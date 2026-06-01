@@ -11,6 +11,9 @@
 const express    = require('express');
 const cors       = require('cors');
 const crypto     = require('crypto');
+// docx: required at startup so export-docx endpoint works reliably without runtime npm install
+let _docxLib = null;
+try { _docxLib = require('docx'); } catch(e) { console.warn('[startup] docx not available — Word export will be unavailable:', e.message); }
 
 // ─── Token Encryption (AES-256-GCM) ──────────────────────────────────────────
 // Key is derived from an env secret + a per-installation salt.
@@ -1190,14 +1193,8 @@ app.post('/api/testplan/export-docx', authMiddleware, async (req, res) => {
   const { summary } = req.body || {};
   if (!summary) return res.status(400).json({ error: 'summary required' });
   try {
-    // Dynamically require docx (install if needed)
-    let docx;
-    try { docx = require('docx'); } catch(e) {
-      const { execSync } = require('child_process');
-      execSync('npm install docx --no-save', { cwd: __dirname, stdio: 'pipe' });
-      docx = require('docx');
-    }
-    const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType, HeadingLevel, BorderStyle, ShadingType, ExternalHyperlink } = docx;
+    if (!_docxLib) return res.status(503).json({ error: 'docx package not available on server — ensure docx is in package.json dependencies' });
+    const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType, HeadingLevel, BorderStyle, ShadingType, ExternalHyperlink } = _docxLib;
 
     // Style constants (from clearlyrated-test-plan skill styles.js)
     const S = {
