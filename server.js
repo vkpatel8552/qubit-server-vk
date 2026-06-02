@@ -1256,7 +1256,14 @@ app.post('/api/testplan/export-docx', authMiddleware, async (req, res) => {
     // Parse summary
     const epics = summary.epics || [];
     const primaryMeta = epics[0] || {};
-    const allStories = epics.flatMap(e => (e.stories || []).map(s => ({ ...s, epicId: e.epicKey || e.id })));
+    // Normalize both DB summary format (storyKey/acceptanceCriteria) and pipeline format (id/ac)
+    const allStories = epics.flatMap(e => (e.stories || []).map(s => ({
+      id:    s.id    || s.storyKey   || '',
+      title: s.title || s.storyTitle || '',
+      desc:  s.desc  || s.fullDescription || s.description || '',
+      ac:    (s.ac   && s.ac.length   > 0) ? s.ac : (s.acceptanceCriteria || []),
+      epicId: e.epicKey || e.id,
+    })));
     const epicTitle = primaryMeta.epicTitle || primaryMeta.title || 'Test Plan';
     const epicKeys = epics.map(e => e.epicKey || e.id).filter(Boolean);
     const jiraSite = summary.site || 'clearlyrated.atlassian.net';
@@ -1268,21 +1275,19 @@ app.post('/api/testplan/export-docx', authMiddleware, async (req, res) => {
 
     const children = [];
 
-    // §1 Title block
+    // §1 Title block — white background, blue text
     children.push(new Paragraph({
-      spacing: { before: 0, after: 40 },
-      shading: S.shading(S.COLORS.BRAND_BLUE),
-      children: [new TextRun({ text: 'Test Plan — ' + epicTitle, bold: true, color: S.COLORS.ROW_WHITE, size: S.FONTS.TITLE, font: S.FONTS.FAMILY })],
+      spacing: { before: 0, after: 8 },
+      border: { bottom: { style: BorderStyle.THICK, size: 12, color: S.COLORS.BRAND_BLUE } },
+      children: [new TextRun({ text: 'Test Plan — ' + epicTitle, bold: true, color: S.COLORS.BRAND_BLUE, size: S.FONTS.TITLE, font: S.FONTS.FAMILY })],
     }));
     children.push(new Paragraph({
-      spacing: { after: 20 },
-      shading: S.shading(S.COLORS.BRAND_BLUE),
-      children: [new TextRun({ text: 'Epic: ' + epicKeys.join(', ') + '  |  Version: 1.0  |  Status: In Progress', color: 'E8E8E8', size: S.FONTS.SUBTITLE, font: S.FONTS.FAMILY })],
+      spacing: { after: 8 },
+      children: [new TextRun({ text: 'Epic: ' + epicKeys.join(', ') + '  |  Version: 1.0  |  Status: In Progress', color: '42526E', size: S.FONTS.SUBTITLE, font: S.FONTS.FAMILY })],
     }));
     children.push(new Paragraph({
-      spacing: { after: 160 },
-      shading: S.shading(S.COLORS.BRAND_BLUE),
-      children: [new TextRun({ text: '\u{1F464} Prepared by: ' + qaTester + '   \u{1F4C5} ' + today, color: 'E8E8E8', size: S.FONTS.BODY, font: S.FONTS.FAMILY })],
+      spacing: { after: 200 },
+      children: [new TextRun({ text: 'Prepared by: ' + qaTester + '   |   ' + today, color: '42526E', size: S.FONTS.BODY, font: S.FONTS.FAMILY })],
     }));
 
     // Overview table
