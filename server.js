@@ -1393,48 +1393,209 @@ app.post('/api/testplan/export-docx', authMiddleware, async (req, res) => {
 
     allStories.forEach(function(s) {
       const ac = s.ac || [];
-      const storyAction = (s.title||'').replace(/^(navigation\s*[-:—]\s*|display\s*[-:—]\s*|build\s*[-:—]\s*|render\s*[-:—]\s*|implement\s*[-:—]\s*|create\s*[-:—]\s*)/i,'').trim();
+      const title = s.title || '';
+      const desc = s.desc || '';
+      const allContent = (title + ' ' + desc + ' ' + ac.join(' ')).toLowerCase();
 
-      const posACs = ac.filter(a => !/error|fail|invalid|cannot|must not|block|prevent/.test(a.toLowerCase()));
-      const negACs = ac.filter(a => /error|fail|invalid|cannot|must not|block|prevent/.test(a.toLowerCase()));
-      const permACs= ac.filter(a => /role|permission|access|admin|manager|hidden|restricted/.test(a.toLowerCase()));
-      const edgeACs= ac.filter(a => /max|min|limit|empty|null|zero|boundary/.test(a.toLowerCase()));
+      // Extract clean business action from story title
+      const storyAction = title
+        .replace(/^(navigation\s*[-:—]\s*|display\s*[-:—]\s*|build\s*[-:—]\s*|render\s*[-:—]\s*|implement\s*[-:—]\s*|create\s*[-:—]\s*|add\s*[-:—]\s*|update\s*[-:—]\s*|validate\s*[-:—]\s*)/i, '')
+        .trim() || title;
+
+      // Clean an AC into a proper scenario validation point
+      function cleanAC(a) {
+        return a
+          .replace(/^(validate that|ensure that|verify that|check that|confirm that|the system (should|must|shall)|system should|it should)\s+/i, '')
+          .replace(/^(user|the user|users) (can|should|must|is able to|are able to)\s+/i, '')
+          .trim();
+      }
+
+      // Derive meaningful test data from story content
+      function testData(type) {
+        const lines = ['Dev environment configured and accessible'];
+        const hasRole   = /admin|manager|cr employee|account manager|user mgmt|role|permission/.test(allContent);
+        const hasData   = /survey|response|account|firm|record|data|report|dashboard/.test(allContent);
+        const hasForm   = /input|field|form|drawer|selector|dropdown|enter|type/.test(allContent);
+        const hasCalc   = /formula|calculat|compute|total|sum|percent|value|roi/.test(allContent);
+        const hasNav    = /menu|navigation|link|breadcrumb|tab|sidebar|page/.test(allContent);
+        const hasFlag   = /feature flag|flag on|flag off|toggle|enabled|disabled/.test(allContent);
+
+        if (type === 'positive') {
+          if (hasRole)  lines.push('Login: Account Manager with required permissions');
+          else          lines.push('Login: Account Manager');
+          if (hasData)  lines.push('At least one qualifying account/record exists in Dev');
+          if (hasCalc)  lines.push('Sample data with known expected output values prepared');
+          if (hasFlag)  lines.push('Feature flag enabled for test firm');
+          if (hasNav)   lines.push('Navigate to the feature entry point in the application');
+        } else if (type === 'negative') {
+          lines.push('Login: Account Manager');
+          lines.push('Invalid/missing test data prepared (empty fields, wrong format, missing records)');
+          if (hasCalc)  lines.push('Input values that produce invalid or out-of-range calculation results');
+          if (hasFlag)  lines.push('Test with feature flag OFF to verify suppression');
+          lines.push('API/service mock available to simulate failure responses');
+        } else if (type === 'edge') {
+          lines.push('Login: Account Manager');
+          lines.push('Boundary test data: empty datasets, maximum allowed values, minimum values (zero/null)');
+          if (hasCalc)  lines.push('Test with 0 values, very large numbers, and decimal precision edge cases');
+          if (hasForm)  lines.push('Test with max character length inputs, special characters, whitespace-only');
+          lines.push('Concurrent session setup to test multi-user edge cases if applicable');
+        } else if (type === 'access') {
+          lines.push('Multiple user role accounts available: Admin, Account Manager, CR Employee, Key Contact, Standard User');
+          lines.push('Feature enabled in Dev for role visibility testing');
+          lines.push('Both authorized and unauthorized role accounts ready');
+        } else if (type === 'exploratory') {
+          lines.push('Login: Account Manager');
+          lines.push('Varied data states: empty, partial, fully populated');
+          lines.push('Multiple browser sessions to test concurrent access');
+        }
+        return lines.join('\n');
+      }
+
+      // Categorize all ACs — NO TRUNCATION, all ACs covered
+      const cleanedACs     = ac.map(cleanAC);
+      const positiveACs    = cleanedACs.filter(a => !/error|fail|invalid|cannot|must not|block|prevent|not allowed|denied|reject/.test(a.toLowerCase()));
+      const negativeACs    = cleanedACs.filter(a => /error|fail|invalid|cannot|must not|block|prevent|not allowed|denied|reject/.test(a.toLowerCase()));
+      const permissionACs  = cleanedACs.filter(a => /role|permission|access|visible|hidden|admin|manager|restricted|authorized|only/.test(a.toLowerCase()));
+      const edgeACs        = cleanedACs.filter(a => /max|min|limit|zero|null|empty|boundary|maximum|minimum|no data|no record/.test(a.toLowerCase()));
+      const displayACs     = positiveACs.filter(a => /display|show|render|visible|appear|load|present/.test(a.toLowerCase()));
+      const interactionACs = positiveACs.filter(a => /click|select|input|enter|submit|save|update|toggle|switch|choose|open|close/.test(a.toLowerCase()));
+      const calcACs        = positiveACs.filter(a => /calculat|compute|formula|total|sum|percent|value|result|equal/.test(a.toLowerCase()));
+      const coveredPos     = new Set([...displayACs, ...interactionACs, ...calcACs]);
+      const remainingPos   = positiveACs.filter(a => !coveredPos.has(a));
 
       const scenarios = [];
 
-      if (posACs.length > 0 || ac.length > 0) {
+      // ── POSITIVE PATH: split into focused groups when many ACs ──────────
+      if (displayACs.length > 0) {
         scenarios.push({
-          heading: 'Validate ' + storyAction + ' works correctly when feature is accessed in normal state',
-          items: (posACs.length > 0 ? posACs : ac).slice(0,6),
-          dataSetup: 'Test account configured in Dev environment\nLogin: Account Manager',
+          heading: 'Validate ' + storyAction + ' renders all required UI elements correctly when page is loaded',
+          items: displayACs,
+          dataSetup: testData('positive'),
         });
       }
-      if (negACs.length > 0) {
+      if (interactionACs.length > 0) {
         scenarios.push({
-          heading: 'Validate error handling when invalid conditions or failure states occur for ' + storyAction.toLowerCase(),
-          items: negACs.slice(0,5),
-          dataSetup: 'Test data with invalid/edge state\nDev environment',
+          heading: 'Validate user interactions with ' + storyAction + ' produce the expected outcomes when triggered',
+          items: interactionACs,
+          dataSetup: testData('positive'),
         });
       }
-      if (permACs.length > 0) {
+      if (calcACs.length > 0) {
         scenarios.push({
-          heading: 'Validate ' + storyAction + ' is accessible or restricted correctly when user role is evaluated',
-          items: permACs.slice(0,5),
-          dataSetup: 'Multiple user roles available: Admin, Manager, Standard User',
+          heading: 'Validate ' + storyAction + ' calculation and business logic produces accurate results when inputs are provided',
+          items: calcACs,
+          dataSetup: testData('positive'),
         });
       }
-      if (edgeACs.length >= 1) {
+      if (remainingPos.length > 0) {
         scenarios.push({
-          heading: 'Validate ' + storyAction + ' handles boundary values correctly when edge-case inputs are provided',
-          items: edgeACs.slice(0,4),
-          dataSetup: 'Boundary-value test data prepared\nDev environment',
+          heading: 'Validate ' + storyAction + ' core positive-path behaviour when all required conditions are met',
+          items: remainingPos,
+          dataSetup: testData('positive'),
         });
       }
-      if (scenarios.length === 0) {
+      // Fallback if nothing matched above positive buckets
+      if (scenarios.length === 0 && positiveACs.length === 0 && ac.length > 0) {
         scenarios.push({
-          heading: 'Validate ' + storyAction + ' when feature is exercised in standard conditions',
-          items: ['Verify the feature renders without errors', 'Confirm core behaviour matches requirements'],
-          dataSetup: 'Test account configured in Dev environment',
+          heading: 'Validate ' + storyAction + ' core behaviour when feature is exercised under normal conditions',
+          items: cleanedACs,
+          dataSetup: testData('positive'),
+        });
+      }
+
+      // ── NEGATIVE / ERROR HANDLING ────────────────────────────────────────
+      if (negativeACs.length > 0) {
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' handles error conditions and invalid states gracefully when failures occur',
+          items: negativeACs,
+          dataSetup: testData('negative'),
+        });
+      } else {
+        // Always include a negative scenario derived from context
+        const inferredNeg = [];
+        if (/input|field|form|enter/.test(allContent)) inferredNeg.push('Verify appropriate error message is shown when required field is left empty');
+        if (/save|submit|update/.test(allContent))     inferredNeg.push('Verify save/submit operation fails gracefully when API returns error');
+        if (/fetch|load|api|service/.test(allContent)) inferredNeg.push('Verify feature handles service unavailability without crashing the page');
+        if (/permission|access|role/.test(allContent)) inferredNeg.push('Verify unauthorized users cannot access this feature via direct URL');
+        inferredNeg.push('Verify system remains stable and no data loss occurs after error condition');
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' handles error and failure conditions gracefully when invalid state is triggered',
+          items: inferredNeg,
+          dataSetup: testData('negative'),
+        });
+      }
+
+      // ── EDGE CASES ───────────────────────────────────────────────────────
+      if (edgeACs.length > 0) {
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' handles boundary and edge-case conditions correctly when limit values are provided',
+          items: edgeACs,
+          dataSetup: testData('edge'),
+        });
+      } else {
+        // Always include edge case scenario based on content type
+        const inferredEdge = [];
+        if (/input|field|value|formula|calculat/.test(allContent)) {
+          inferredEdge.push('Test with zero/null/empty values where numeric input is expected');
+          inferredEdge.push('Test with maximum allowed value and verify no overflow or truncation');
+          inferredEdge.push('Test with decimal precision edge cases (e.g. 0.001, 999999.99)');
+        }
+        if (/list|table|record|row|data/.test(allContent)) {
+          inferredEdge.push('Test feature when data set is empty (zero records)');
+          inferredEdge.push('Test with exactly 1 record and with large data set (100+ records)');
+        }
+        if (/save|persist|store/.test(allContent)) {
+          inferredEdge.push('Verify data persists correctly after page refresh');
+          inferredEdge.push('Verify concurrent saves from two sessions do not corrupt data');
+        }
+        if (inferredEdge.length === 0) {
+          inferredEdge.push('Test feature with no pre-existing data (clean state)');
+          inferredEdge.push('Test with maximum volume of data to verify performance is acceptable');
+          inferredEdge.push('Verify feature behaviour is consistent across multiple browser refreshes');
+        }
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' handles boundary conditions when edge-case and limit values are encountered',
+          items: inferredEdge,
+          dataSetup: testData('edge'),
+        });
+      }
+
+      // ── ROLE-BASED ACCESS CONTROL ─────────────────────────────────────────
+      if (permissionACs.length > 0) {
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' enforces correct role-based access and visibility when different users interact',
+          items: permissionACs,
+          dataSetup: testData('access'),
+        });
+      } else if (/role|admin|manager|cr employee|account manager|user mgmt|permission/.test(allContent)) {
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' is accessible only to users with the required role when access is attempted',
+          items: [
+            'Verify the feature is visible and fully functional for the primary authorized role (Account Manager)',
+            'Verify the feature is not accessible or is restricted for unauthorized roles',
+            'Verify that attempting direct URL access by unauthorized role results in redirect or access-denied response',
+          ],
+          dataSetup: testData('access'),
+        });
+      }
+
+      // ── EXPLORATORY / ADHOC ───────────────────────────────────────────────
+      {
+        const exploratoryItems = [];
+        if (/navigation|menu|link|tab/.test(allContent))
+          exploratoryItems.push('Navigate to the feature using different entry points (direct URL, menu, breadcrumb) and verify each path works');
+        if (/save|persist|retain|remember/.test(allContent))
+          exploratoryItems.push('Verify data entered is retained after navigating away and returning to the page');
+        if (/api|service|fetch|load/.test(allContent))
+          exploratoryItems.push('Verify feature gracefully handles slow API response (simulate network latency) without hanging indefinitely');
+        if (/update|change|modify|edit/.test(allContent))
+          exploratoryItems.push('Verify that cancelling an in-progress update/edit does not partially save data');
+        exploratoryItems.push('Verify the feature is responsive and layout is not broken on different screen sizes');
+        exploratoryItems.push('Verify no console errors or JavaScript exceptions appear during standard usage flow');
+        scenarios.push({
+          heading: 'Validate ' + storyAction + ' exploratory and adhoc scenarios to uncover undocumented behaviour',
+          items: exploratoryItems,
+          dataSetup: testData('exploratory'),
         });
       }
 
@@ -1576,7 +1737,7 @@ app.post('/api/testplan/export-docx', authMiddleware, async (req, res) => {
 
     // Build and send the document
     const doc = new Document({
-      sections: [{ properties: { page: { margin: { top: 1080, bottom: 1080, left: 1080, right: 1080 } } }, children }],
+      sections: [{ properties: { page: { margin: { top: 720, bottom: 720, left: 720, right: 720 } } }, children }],
     });
 
     const buffer = await Packer.toBuffer(doc);
